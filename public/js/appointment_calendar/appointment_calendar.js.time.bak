@@ -1,0 +1,1233 @@
+// Using global FullCalendar from CDN
+console.log('=== APPOINTMENT CALENDAR SCRIPT LOADING ===');
+console.log('jQuery available:', typeof jQuery !== 'undefined', typeof $ !== 'undefined');
+console.log('FullCalendar available:', typeof FullCalendar !== 'undefined');
+console.log('Tailwind available:', typeof tailwind !== 'undefined');
+
+// Wait for jQuery and FullCalendar to be available
+(function checkAndInit() {
+    if (typeof jQuery === 'undefined' || typeof $ === 'undefined') {
+        console.log('Waiting for jQuery...');
+        setTimeout(checkAndInit, 100);
+        return;
+    }
+    
+    if (typeof FullCalendar === 'undefined') {
+        console.log('Waiting for FullCalendar...');
+        setTimeout(checkAndInit, 100);
+        return;
+    }
+    
+    // Wait for Tailwind Modal to be available
+    if (typeof tailwind === 'undefined' || !tailwind.Modal) {
+        console.log('Waiting for Tailwind Modal...');
+        setTimeout(checkAndInit, 100);
+        return;
+    }
+    
+    console.log('=== ALL DEPENDENCIES LOADED ===');
+    console.log('jQuery version:', $.fn.jquery);
+    console.log('FullCalendar available:', typeof FullCalendar !== 'undefined');
+    console.log('FullCalendar.Calendar available:', typeof FullCalendar.Calendar !== 'undefined');
+    console.log('Tailwind Modal available:', typeof tailwind !== 'undefined' && typeof tailwind.Modal !== 'undefined');
+    
+    $(document).ready(function() {
+        console.log('=== DOCUMENT READY ===');
+        console.log('Calendar element exists:', $("#calendar").length > 0);
+        console.log('Calendar element:', $("#calendar")[0]);
+        
+        // CRITICAL: Destroy any existing calendar instance first
+        const existingCalendarEl = $("#calendar")[0];
+        if (existingCalendarEl && existingCalendarEl._fullCalendar) {
+            console.log('Destroying existing calendar instance...');
+            try {
+                const existingCalendar = existingCalendarEl._fullCalendar;
+                if (existingCalendar && typeof existingCalendar.destroy === 'function') {
+                    existingCalendar.destroy();
+                    console.log('Existing calendar destroyed');
+                }
+            } catch (e) {
+                console.error('Error destroying existing calendar:', e);
+            }
+        }
+        
+        if ($("#calendar").length) {
+            console.log('=== INITIALIZING APPOINTMENT CALENDAR ===');
+        // Initialize modal early, before calendar is rendered
+        // This is CRITICAL - the modal must be initialized before use
+        const appointmentModal = document.getElementById('appointmentModal');
+        if (appointmentModal && typeof tailwind !== 'undefined' && tailwind.Modal) {
+            try {
+                const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                console.log('=== MODAL INITIALIZED EARLY ===');
+                console.log('Modal instance:', modalInstance);
+                console.log('Modal element:', appointmentModal);
+                // Store reference globally for debugging
+                window.appointmentModalInstance = modalInstance;
+            } catch (error) {
+                console.error('Error initializing modal early:', error);
+            }
+        } else {
+            console.error('Cannot initialize modal - element or Tailwind not available');
+            console.log('appointmentModal element:', appointmentModal);
+            console.log('tailwind available:', typeof tailwind !== 'undefined');
+            console.log('tailwind.Modal available:', typeof tailwind !== 'undefined' && typeof tailwind.Modal !== 'undefined');
+        }
+        
+        // Add modal close handlers early
+        initializeModalHandlers();
+        // Get appointments data from window object (passed from Blade)
+        let appointments = window.appointmentsData || [];
+        
+        console.log('Raw appointments data:', appointments);
+        console.log('Appointments type:', typeof appointments);
+        console.log('Is array:', Array.isArray(appointments));
+        console.log('Appointments length:', appointments.length);
+        
+        // Ensure appointments is a proper array of objects
+        if (Array.isArray(appointments) && appointments.length > 0) {
+            console.log('First appointment sample:', appointments[0]);
+            console.log('First appointment type:', typeof appointments[0]);
+            console.log('First appointment keys:', Object.keys(appointments[0]));
+        }
+        
+        // Format appointments for FullCalendar
+        const events = appointments.map(appointment => {
+            console.log('Processing appointment:', appointment);
+            
+            // Check if appointment is a valid object
+            if (!appointment || typeof appointment !== 'object') {
+                console.error('Invalid appointment object:', appointment);
+                return null;
+            }
+            
+            // Ensure required fields have fallback values
+            // Use data from appointment-management module (which has proper time formatting)
+            const appointmentId = appointment.id || appointment.ID || null;
+            const appointmentTitle = appointment.description || appointment.title || 'Untitled Appointment';
+            const appointmentDate = appointment.appointment_date || appointment.date || null;
+            // CRITICAL: Use the time field from appointment-management data (properly formatted)
+            const appointmentTime = appointment.time || appointment.scheduled_time || appointment.appointment_time || null;
+            
+            // Get linked data from business-management and service-management modules
+            const businessManagement = appointment.business_management || null;
+            const serviceManagement = appointment.service_management || null;
+            
+            // If no ID, skip this appointment (can't create event without ID)
+            if (!appointmentId) {
+                console.warn('Skipping appointment without ID:', appointment);
+                return null;
+            }
+            
+            // If no date, use today's date as fallback
+            if (!appointmentDate) {
+                console.warn('Appointment missing date, using today as fallback:', appointmentId);
+            }
+            
+            // Determine color based on status
+            let color;
+            switch((appointment.status || '').toLowerCase()) {
+                case 'pending':
+                    color = '#f59e0b'; // warning
+                    break;
+                case 'approved':
+                    color = '#10b981'; // success
+                    break;
+                case 'cancelled':
+                    color = '#ef4444'; // danger
+                    break;
+                case 'completed':
+                    color = '#3b82f6'; // primary
+                    break;
+                default:
+                    color = '#6b7280'; // info/gray
+            }
+            
+            // CRITICAL: Use "Scheduled Time" / "Appointment Time" field to map events to calendar
+            // FullCalendar needs ISO datetime string: YYYY-MM-DDTHH:mm:ss
+            // If only date is provided, FullCalendar treats it as all-day event
+            console.log('Processing appointment date/time:', {
+                appointment_date: appointmentDate,
+                scheduled_time: appointmentTime, // This is the "Scheduled Time" / "Appointment Time" field
+                appointment_id: appointmentId
+            });
+            
+            // Get the date part (remove any time component if present)
+            // We use appointment_date for the date, and time field for the time
+            let datePart = appointmentDate;
+            
+            // Handle missing or invalid date
+            if (!datePart) {
+                // Use today's date as fallback
+                const today = new Date();
+                datePart = today.toISOString().split('T')[0];
+                console.warn('Using today as fallback date for appointment:', appointmentId);
+            } else if (typeof datePart === 'string') {
+                // If it includes time, extract just the date part
+                // We ignore time in appointment_date and use the separate time field instead
+                if (datePart.includes('T') || datePart.includes(' ')) {
+                    datePart = datePart.split('T')[0].split(' ')[0];
+                }
+                // Validate date format (should be YYYY-MM-DD)
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+                    // Try to parse and reformat
+                    try {
+                        const parsedDate = new Date(datePart);
+                        if (!isNaN(parsedDate.getTime())) {
+                            datePart = parsedDate.toISOString().split('T')[0];
+                        } else {
+                            // Invalid date, use today
+                            const today = new Date();
+                            datePart = today.toISOString().split('T')[0];
+                            console.warn('Invalid date format, using today as fallback:', appointmentId);
+                        }
+                    } catch (e) {
+                        const today = new Date();
+                        datePart = today.toISOString().split('T')[0];
+                        console.warn('Date parsing error, using today as fallback:', appointmentId);
+                    }
+                }
+            } else if (datePart instanceof Date) {
+                // If it's a Date object, format it
+                if (isNaN(datePart.getTime())) {
+                    // Invalid date, use today
+                    const today = new Date();
+                    datePart = today.toISOString().split('T')[0];
+                    console.warn('Invalid Date object, using today as fallback:', appointmentId);
+                } else {
+                    datePart = datePart.toISOString().split('T')[0];
+                }
+            } else {
+                // Unknown format, use today
+                const today = new Date();
+                datePart = today.toISOString().split('T')[0];
+                console.warn('Unknown date format, using today as fallback:', appointmentId);
+            }
+            
+            let startDateTime = datePart; // Start with just the date
+            let hasTime = false; // Track if we successfully parsed a time from the "Scheduled Time" field
+            
+            // CRITICAL: Use the "Scheduled Time" / "Appointment Time" field (appointment.time)
+            // This is the primary source for event timing
+            if (appointmentTime && typeof appointmentTime === 'string' && appointmentTime.trim() !== '') {
+                let timeStr = appointmentTime.trim();
+                console.log('Using Scheduled Time / Appointment Time field:', timeStr);
+                
+                // Try to parse and format the time
+                let hours = 0;
+                let minutes = 0;
+                let seconds = 0;
+                let timeParsed = false;
+                
+                try {
+                    // Normalize the time string - remove extra spaces
+                    timeStr = timeStr.replace(/\s+/g, ' ').trim();
+                    
+                    // Check for 12-hour format with AM/PM (with or without space)
+                    // Matches: "9:00 AM", "1:30PM", "9:0 AM", "1:5 PM", etc.
+                    const twelveHourMatch = timeStr.match(/(\d{1,2}):(\d{1,2})\s*(AM|PM|am|pm)/i);
+                    if (twelveHourMatch) {
+                        hours = parseInt(twelveHourMatch[1], 10);
+                        minutes = parseInt(twelveHourMatch[2], 10) || 0;
+                        const ampm = twelveHourMatch[3].toUpperCase();
+                        
+                        // Convert to 24-hour format
+                        if (ampm === 'PM' && hours !== 12) {
+                            hours += 12;
+                        } else if (ampm === 'AM' && hours === 12) {
+                            hours = 0;
+                        }
+                        
+                        timeParsed = true;
+                        console.log('Parsed 12-hour time from Scheduled Time field:', { hours, minutes, ampm, original: timeStr });
+                    } else {
+                        // Parse 24-hour format (e.g., "09:00", "14:30", "9:0", "09:00:00", "9:00:0")
+                        const timeParts = timeStr.split(':');
+                        if (timeParts.length >= 2) {
+                            hours = parseInt(timeParts[0], 10) || 0;
+                            minutes = parseInt(timeParts[1], 10) || 0;
+                            seconds = timeParts.length >= 3 ? (parseInt(timeParts[2], 10) || 0) : 0;
+                            timeParsed = true;
+                            
+                            console.log('Parsed 24-hour time from Scheduled Time field:', { hours, minutes, seconds, original: timeStr });
+                        }
+                    }
+                    
+                    // Validate parsed time values
+                    if (timeParsed && !isNaN(hours) && !isNaN(minutes) && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
+                        // Format as HH:mm:ss
+                        const formattedTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                        
+                        // Combine date and time - CRITICAL: This makes it a timed event, not all-day
+                        startDateTime = datePart + 'T' + formattedTime;
+                        hasTime = true;
+                        console.log('Mapped event using Scheduled Time:', {
+                            date: datePart,
+                            time: formattedTime,
+                            combined: startDateTime,
+                            originalTime: timeStr
+                        });
+                    } else {
+                        console.warn('Invalid time values from Scheduled Time field, using default time of 00:00:00');
+                        console.warn('Parsed values:', { hours, minutes, seconds, original: timeStr });
+                        // Use default time if parsing failed but time exists
+                        startDateTime = datePart + 'T00:00:00';
+                        hasTime = true;
+                    }
+                } catch (e) {
+                    console.error('Error parsing Scheduled Time / Appointment Time:', e, 'Time string:', timeStr);
+                    // If time parsing fails but time exists, use default time to ensure it's not all-day
+                    console.warn('Using default time (00:00:00) due to parsing error');
+                    startDateTime = datePart + 'T00:00:00';
+                    hasTime = true;
+                }
+            } else {
+                // No Scheduled Time / Appointment Time specified, use date only (all-day event)
+                console.log('No Scheduled Time / Appointment Time specified, using date only (all-day event)');
+            }
+            
+            // Validate the datetime format before creating event
+            // Ensure startDateTime is always valid
+            if (!startDateTime || startDateTime === 'undefined' || startDateTime === 'null') {
+                console.error('Invalid startDateTime, using today as fallback:', appointmentId);
+                const today = new Date();
+                startDateTime = today.toISOString().split('T')[0];
+                if (hasTime) {
+                    startDateTime += 'T00:00:00';
+                }
+            }
+            
+            const eventObj = {
+                id: appointmentId,
+                title: appointmentTitle,
+                start: startDateTime, // Now includes time if available
+                allDay: !hasTime, // Explicitly set allDay to false if time exists
+                backgroundColor: color,
+                borderColor: color,
+                textColor: '#ffffff',
+                className: 'appointment-event',
+                extendedProps: {
+                    tracking_number: appointment.tracking_number || appointment.trackingNumber || null,
+                    remarks: appointment.remarks || null,
+                    status: appointment.status || 'pending',
+                    user_id: appointment.user_id || appointment.users_id || null,
+                    user_name: appointment.user_name || appointment.userName || 'N/A',
+                    category_name: appointment.category_name || appointment.categoryName || 'N/A',
+                    time: appointmentTime || null, // Scheduled Time / Appointment Time from appointment-management
+                    appointment_date: appointmentDate || null,
+                    // Link to business-management module data
+                    business_management: businessManagement,
+                    // Link to service-management module data
+                    service_management: serviceManagement,
+                    // Store appointment-management link
+                    appointment_management_id: appointmentId
+                }
+            };
+            
+            // Log the final event object for debugging
+            console.log('Created event object:', {
+                id: eventObj.id,
+                title: eventObj.title,
+                start: eventObj.start,
+                allDay: eventObj.allDay,
+                hasTime: hasTime,
+                timeValue: appointmentTime,
+                hasDate: !!appointmentDate
+            });
+            
+            return eventObj;
+        }).filter(event => event !== null); // Remove null entries
+        
+       
+        // Initialize draggable for sidebar events (if FullCalendar.Draggable exists)
+        if ($("#calendar-events").length && typeof FullCalendar !== 'undefined' && FullCalendar.Draggable) {
+            new FullCalendar.Draggable($("#calendar-events")[0], {
+                itemSelector: ".event",
+                eventData: function (eventEl) {
+                    return {
+                        title: $(eventEl).find(".event__title").html(),
+                        duration: {
+                            days: parseInt(
+                                $(eventEl).find(".event__days").text()
+                            ),
+                        },
+                    };
+                },
+            });
+        }
+
+        console.log('Creating FullCalendar instance...');
+        console.log('Events to load:', events.length);
+        console.log('Sample event:', events[0]);
+        
+        // Check if interaction plugin is needed for eventClick
+        // FullCalendar v6 global build includes interaction by default, but let's verify
+        console.log('FullCalendar.Interaction available:', typeof FullCalendar.Interaction !== 'undefined');
+        console.log('FullCalendar.InteractionPlugin available:', typeof FullCalendar.InteractionPlugin !== 'undefined');
+        
+        let calendar = new FullCalendar.Calendar($("#calendar")[0], {
+            droppable: false,
+            headerToolbar: {
+                left: "prev,next today",
+                center: "title",
+                right: "dayGridMonth,timeGridWeek,timeGridDay,listWeek",
+            },
+            navLinks: true,
+            editable: false,
+            dayMaxEvents: true,
+            allDaySlot: false, // Hide all-day slot since we have specific times
+            slotMinTime: '00:00:00',
+            slotMaxTime: '24:00:00',
+            slotDuration: '00:30:00', // 30-minute slots
+            slotLabelInterval: '01:00:00', // Show hour labels
+            events: events,
+            // CRITICAL: eventClick requires interaction plugin in FullCalendar v6
+            // The global build should include it, but we'll also use a direct DOM listener as backup
+            eventClick: function(info) {
+                console.log('=== eventClick HANDLER FIRED ===');
+                console.log('=== CALENDAR EVENT CLICKED (INSIDE HANDLER) ===');
+                console.log('=== CALENDAR EVENT CLICKED ===');
+                console.log('Info object:', info);
+                console.log('Event object:', info.event);
+                
+                // Prevent default behavior
+                if (info.jsEvent) {
+                    info.jsEvent.preventDefault();
+                    info.jsEvent.stopPropagation();
+                }
+                
+                // Show appointment details in modal
+                const event = info.event;
+                console.log('Appointment clicked:', event);
+                console.log('Event title:', event.title);
+                console.log('Event extendedProps:', event.extendedProps);
+                console.log('Event ID:', event.id);
+                
+                // Verify event has required data
+                if (!event || !event.extendedProps) {
+                    console.error('Event object is missing required data!', event);
+                    alert('Error: Could not load appointment details. Please try again.');
+                    return;
+                }
+                
+                // Clear any previously stored appointment ID to prevent modal listener from interfering
+                const appointmentModal = document.getElementById('appointmentModal');
+                if (!appointmentModal) {
+                    console.error('Appointment modal element not found!');
+                    alert('Error: Modal element not found. Please refresh the page.');
+                    return;
+                }
+                
+                appointmentModal.removeAttribute('data-current-appointment-id');
+                // Set flag to indicate details are being loaded directly
+                appointmentModal.setAttribute('data-details-loaded', 'true');
+                
+                // Load appointment details directly from the event object
+                // The FullCalendar event already has all the data we need
+                console.log('Loading appointment details...');
+                try {
+                    loadAppointmentDetails(event);
+                    console.log('Appointment details loaded successfully');
+                } catch (error) {
+                    console.error('Error loading appointment details:', error);
+                    alert('Error loading appointment details: ' + error.message);
+                    return;
+                }
+                
+                // Show the modal immediately after loading details
+                // IMPORTANT: Initialize modal instance first (same as eye icon does)
+                // CRITICAL: Reset modal state before showing to fix aria-hidden focus issue
+                console.log('Resetting modal state and showing modal...');
+                
+                // First, ensure modal is in a clean state
+                appointmentModal.removeAttribute('aria-hidden');
+                appointmentModal.style.display = '';
+                appointmentModal.style.visibility = '';
+                appointmentModal.style.opacity = '';
+                
+                // Remove focus from modal if it has it
+                if (appointmentModal === document.activeElement || appointmentModal.contains(document.activeElement)) {
+                    console.log('Removing focus from modal before showing');
+                    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                        document.activeElement.blur();
+                    }
+                }
+                
+                setTimeout(function() {
+                    try {
+                        // Get or create modal instance FIRST (this is what makes eye icon work)
+                        if (typeof tailwind !== 'undefined' && tailwind.Modal && appointmentModal) {
+                            const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                            console.log('Modal instance created/retrieved:', modalInstance);
+                            
+                            // Now show the modal
+                            modalInstance.show();
+                            console.log('Modal show() called on instance');
+                            
+                            // Ensure modal is properly visible after show
+                            setTimeout(function() {
+                                appointmentModal.removeAttribute('aria-hidden');
+                                appointmentModal.setAttribute('aria-modal', 'true');
+                                console.log('Modal state reset after show');
+                            }, 50);
+                        } else {
+                            console.error('Tailwind Modal not available, using fallback');
+                            showAppointmentModal();
+                        }
+                    } catch (error) {
+                        console.error('Error showing modal:', error);
+                        alert('Error showing modal: ' + error.message);
+                    }
+                }, 100);
+            },
+            eventDidMount: function(info) {
+                // Add tooltip
+                info.el.title = `${info.event.title}\nStatus: ${info.event.extendedProps.status || 'N/A'}${info.event.extendedProps.tracking_number ? '\nTracking #: ' + info.event.extendedProps.tracking_number : ''}`;
+                
+                // Add data attributes for fallback click handler
+                info.el.setAttribute('data-event-id', info.event.id);
+                info.el.setAttribute('data-event-title', info.event.title);
+                console.log('Event mounted:', info.event.id, info.event.title, info.el);
+            },
+            dateClick: function(info) {
+                console.log('Date clicked:', info.dateStr);
+                // You can add functionality to create new appointment on date click
+            },
+            drop: function (info) {
+                if (
+                    $("#checkbox-events").length &&
+                    $("#checkbox-events")[0].checked
+                ) {
+                    $(info.draggedEl).parent().remove();
+
+                    if ($("#calendar-events").children().length == 1) {
+                        $("#calendar-no-events").removeClass("hidden");
+                    }
+                }
+            },
+        });
+
+        console.log('Rendering calendar...');
+        calendar.render();
+        
+        console.log('=== CALENDAR RENDERED ===');
+        console.log('Calendar instance:', calendar);
+        console.log('Calendar events after render:', calendar.getEvents());
+        console.log('Total events loaded:', calendar.getEvents().length);
+        console.log('Calendar element:', $("#calendar")[0]);
+        
+        // Check if eventClick is registered
+        try {
+            const eventClickOption = calendar.getOption('eventClick');
+            console.log('Calendar eventClick option type:', typeof eventClickOption);
+            console.log('Calendar eventClick is function:', typeof eventClickOption === 'function');
+            console.log('Calendar eventClick value:', eventClickOption);
+        } catch (e) {
+            console.error('Error checking eventClick option:', e);
+        }
+        
+        // Store calendar instance globally for debugging
+        window.appointmentCalendar = calendar;
+        console.log('Calendar stored in window.appointmentCalendar for debugging');
+        
+        // CRITICAL: Add event delegation on calendar container to catch ALL clicks
+        // This will work even if eventClick handler doesn't fire
+        const calendarEl = $("#calendar")[0];
+        if (calendarEl) {
+            console.log('Adding event delegation to calendar container...');
+            
+            // Use a named function so we can remove it if needed
+            const calendarClickHandler = function(e) {
+                console.log('=== CALENDAR CONTAINER CLICKED ===', e.target);
+                
+                // Check if click is on an event element (try multiple selectors)
+                let clickedEvent = e.target.closest('.fc-event');
+                
+                // If not found, check parent elements
+                if (!clickedEvent) {
+                    let current = e.target;
+                    while (current && current !== calendarEl) {
+                        if (current.classList && current.classList.contains('fc-event')) {
+                            clickedEvent = current;
+                            break;
+                        }
+                        current = current.parentElement;
+                    }
+                }
+                
+                // Also check for event title container
+                if (!clickedEvent) {
+                    clickedEvent = e.target.closest('.fc-event-title-container')?.closest('.fc-event') ||
+                                 e.target.closest('[class*="fc-event"]');
+                }
+                
+                if (clickedEvent) {
+                    console.log('=== EVENT DELEGATION: EVENT CLICKED ===', clickedEvent);
+                    console.log('Click target:', e.target);
+                    console.log('Clicked event element:', clickedEvent);
+                    
+                    // Get event ID from data attribute
+                    let eventId = clickedEvent.getAttribute('data-event-id');
+                    console.log('Event ID from delegation:', eventId);
+                    
+                    // If no ID, try to find by title or other means
+                    if (!eventId) {
+                        // Try to get title from the clicked element
+                        const eventTitle = clickedEvent.textContent?.trim() || 
+                                         clickedEvent.querySelector('.fc-event-title')?.textContent?.trim();
+                        console.log('No event ID, trying to find by title:', eventTitle);
+                        
+                        if (eventTitle) {
+                            // Find event by matching title
+                            const allEvents = calendar.getEvents();
+                            const matchingEventByTitle = allEvents.find(ev => 
+                                ev.title === eventTitle || 
+                                clickedEvent.textContent.includes(ev.title)
+                            );
+                            if (matchingEventByTitle) {
+                                eventId = matchingEventByTitle.id;
+                                console.log('Found event ID by title:', eventId);
+                            }
+                        }
+                    }
+                    
+                    // Try to find the event
+                    let matchingEvent = null;
+                    
+                    if (eventId) {
+                        matchingEvent = calendar.getEventById(eventId);
+                    }
+                    
+                    // If still not found, try to find by title or by iterating all events
+                    if (!matchingEvent) {
+                        const eventTitle = clickedEvent.textContent?.trim() || 
+                                         clickedEvent.querySelector('.fc-event-title')?.textContent?.trim();
+                        const allEvents = calendar.getEvents();
+                        matchingEvent = allEvents.find(ev => {
+                            if (eventTitle) {
+                                return ev.title === eventTitle || 
+                                       clickedEvent.textContent.includes(ev.title) ||
+                                       (ev.id && clickedEvent.getAttribute('data-event-id') === String(ev.id));
+                            }
+                            return false;
+                        });
+                        
+                        // Last resort: try to match by position or first event if only one
+                        if (!matchingEvent && allEvents.length === 1) {
+                            matchingEvent = allEvents[0];
+                            console.log('Using single event as fallback');
+                        }
+                    }
+                    
+                    if (matchingEvent) {
+                        console.log('Found event via delegation:', matchingEvent);
+                        e.preventDefault();
+                        e.stopPropagation();
+                        
+                        // Load and show modal
+                        const appointmentModal = document.getElementById('appointmentModal');
+                        if (appointmentModal) {
+                            appointmentModal.removeAttribute('data-current-appointment-id');
+                            appointmentModal.setAttribute('data-details-loaded', 'true');
+                            
+                            // Reset modal state
+                            appointmentModal.removeAttribute('aria-hidden');
+                            appointmentModal.style.display = '';
+                            appointmentModal.style.visibility = '';
+                            appointmentModal.style.opacity = '';
+                            
+                            // Remove focus
+                            if (appointmentModal === document.activeElement || appointmentModal.contains(document.activeElement)) {
+                                if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                                    document.activeElement.blur();
+                                }
+                            }
+                            
+                            // Load details and show
+                            loadAppointmentDetails(matchingEvent);
+                            setTimeout(() => {
+                                if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+                                    const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                                    modalInstance.show();
+                                    setTimeout(() => {
+                                        appointmentModal.removeAttribute('aria-hidden');
+                                        appointmentModal.setAttribute('aria-modal', 'true');
+                                    }, 50);
+                                }
+                            }, 100);
+                        }
+                    } else {
+                        console.error('Could not find matching event for clicked element');
+                        console.log('Clicked element:', clickedEvent);
+                        console.log('All calendar events:', calendar.getEvents());
+                    }
+                } else {
+                    // Log what was clicked for debugging
+                    console.log('Click not on event element:', e.target);
+                    console.log('Target classes:', e.target.className);
+                    console.log('Target tag:', e.target.tagName);
+                }
+            };
+            
+            // Add listener with capture phase to catch early
+            calendarEl.addEventListener('click', calendarClickHandler, true);
+            
+            // Also add to document as ultimate fallback
+            document.addEventListener('click', function(e) {
+                // Only process if click is inside calendar
+                if (calendarEl.contains(e.target)) {
+                    calendarClickHandler(e);
+                }
+            }, true);
+            
+            console.log('Event delegation added to calendar container and document');
+        }
+        
+        // Verify events are clickable by checking DOM and add fallback click handlers
+        setTimeout(function() {
+            const eventElements = document.querySelectorAll('.fc-event, [class*="fc-event"]');
+            console.log('=== CHECKING EVENT ELEMENTS ===');
+            console.log('Found event elements in DOM:', eventElements.length);
+            
+            eventElements.forEach((el, index) => {
+                console.log(`Event ${index}:`, el);
+                console.log(`  - Has pointer-events:`, window.getComputedStyle(el).pointerEvents);
+                console.log(`  - Has cursor:`, window.getComputedStyle(el).cursor);
+                console.log(`  - Is visible:`, window.getComputedStyle(el).display !== 'none');
+                
+                // Get event ID from the element
+                const eventId = el.getAttribute('data-event-id') || 
+                               el.closest('.fc-event')?.getAttribute('data-event-id') ||
+                               el.querySelector('[data-event-id]')?.getAttribute('data-event-id');
+                
+                // Try to find event by looking at the calendar
+                let calendarEvent = null;
+                try {
+                    const allEvents = calendar.getEvents();
+                    // Try to match by element
+                    calendarEvent = allEvents.find(ev => {
+                        const eventEl = calendar.getEventById(ev.id);
+                        return false; // We'll use a different approach
+                    });
+                    
+                    // Better approach: get event from element using FullCalendar API
+                    const eventSeg = calendar.getEventSegments ? calendar.getEventSegments(el) : null;
+                } catch (e) {
+                    console.log('Could not get event from calendar:', e);
+                }
+                
+                // Add fallback click listener that finds the event and triggers modal
+                // Use capture phase to ensure we catch it first
+                el.addEventListener('click', function(e) {
+                    console.log('=== FALLBACK: DIRECT EVENT ELEMENT CLICKED ===', el);
+                    console.log('Click event:', e);
+                    console.log('Event target:', e.target);
+                    console.log('Event currentTarget:', e.currentTarget);
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation(); // Stop all other handlers
+                    
+                    // Get event ID from data attribute
+                    const eventId = el.getAttribute('data-event-id');
+                    console.log('Event ID from element:', eventId);
+                    
+                    if (!eventId) {
+                        console.error('No event ID found on element');
+                        return;
+                    }
+                    
+                    // Find the event by ID
+                    const matchingEvent = calendar.getEventById(eventId);
+                    console.log('Matching event found:', matchingEvent);
+                    
+                    if (matchingEvent) {
+                        console.log('Found matching event:', matchingEvent);
+                        // Direct approach - load details and show modal
+                        const appointmentModal = document.getElementById('appointmentModal');
+                        if (appointmentModal) {
+                            appointmentModal.removeAttribute('data-current-appointment-id');
+                            appointmentModal.setAttribute('data-details-loaded', 'true');
+                            console.log('Loading appointment details via fallback...');
+                            loadAppointmentDetails(matchingEvent);
+                            setTimeout(() => {
+                                console.log('Showing modal via fallback...');
+                                
+                                // CRITICAL: Reset modal state before showing to fix aria-hidden focus issue
+                                appointmentModal.removeAttribute('aria-hidden');
+                                appointmentModal.style.display = '';
+                                appointmentModal.style.visibility = '';
+                                appointmentModal.style.opacity = '';
+                                
+                                // Remove focus from modal if it has it
+                                if (appointmentModal === document.activeElement || appointmentModal.contains(document.activeElement)) {
+                                    console.log('Fallback: Removing focus from modal before showing');
+                                    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                                        document.activeElement.blur();
+                                    }
+                                }
+                                
+                                // Initialize modal instance FIRST (same as eye icon)
+                                if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+                                    const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                                    console.log('Fallback: Modal instance created/retrieved');
+                                    modalInstance.show();
+                                    console.log('Fallback: Modal show() called');
+                                    
+                                    // Ensure modal is properly visible after show
+                                    setTimeout(function() {
+                                        appointmentModal.removeAttribute('aria-hidden');
+                                        appointmentModal.setAttribute('aria-modal', 'true');
+                                        console.log('Fallback: Modal state reset after show');
+                                    }, 50);
+                                } else {
+                                    showAppointmentModal();
+                                }
+                            }, 100);
+                        } else {
+                            console.error('Appointment modal not found');
+                        }
+                    } else {
+                        console.error('Could not find matching event for ID:', eventId);
+                        console.log('All calendar events:', calendar.getEvents());
+                    }
+                }, true);
+            });
+        }, 2000);
+        
+        // Modal is already initialized earlier, no need to re-initialize
+        
+        // Add click handler to all rendered events
+        setTimeout(() => {
+            const eventElements = document.querySelectorAll('.fc-event');
+            console.log('Found event elements:', eventElements.length);
+            eventElements.forEach((el, index) => {
+                console.log(`Event ${index}:`, el);
+            });
+        }, 1000);
+        
+        // Handle view button clicks in sidebar (eye icon)
+        // Store appointment ID when clicked, then load when modal shows
+        if (appointmentModal) {
+            
+            // Store appointment ID when view button is clicked
+            document.addEventListener('click', function(e) {
+                const eyeIcon = e.target.closest('.view-appointment-btn');
+                if (eyeIcon) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    
+                    const appointmentId = eyeIcon.getAttribute('data-appointment-id');
+                    console.log('Eye icon clicked, appointment ID:', appointmentId);
+                    
+                    // Store appointment ID in the modal for later use
+                    appointmentModal.setAttribute('data-current-appointment-id', appointmentId);
+                    console.log('Stored appointment ID:', appointmentId);
+                    
+                    // Manually trigger modal if data-tw-toggle didn't work
+                    setTimeout(function() {
+                        try {
+                            if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+                                const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                                modalInstance.show();
+                                console.log('Modal manually triggered');
+                            } else {
+                                console.error('Tailwind Modal not available');
+                            }
+                        } catch (error) {
+                            console.error('Error showing modal:', error);
+                        }
+                    }, 50);
+                }
+            });
+            
+            // Load appointment details when modal shows
+            appointmentModal.addEventListener('show.tw.modal', function() {
+                console.log('=== MODAL SHOW EVENT FIRED ===');
+                console.log('data-details-loaded:', appointmentModal.getAttribute('data-details-loaded'));
+                console.log('data-current-appointment-id:', appointmentModal.getAttribute('data-current-appointment-id'));
+                
+                // Skip if details are already loaded (from direct calendar click)
+                if (appointmentModal.getAttribute('data-details-loaded') === 'true') {
+                    console.log('Details already loaded, skipping modal listener');
+                    appointmentModal.removeAttribute('data-details-loaded');
+                    return;
+                }
+                
+                const storedAppointmentId = appointmentModal.getAttribute('data-current-appointment-id');
+                console.log('Modal show event triggered - appointment ID:', storedAppointmentId);
+                
+                if (storedAppointmentId) {
+                    const appointment = appointments.find(a => a.id == storedAppointmentId);
+                    console.log('Found appointment:', appointment);
+                    
+                    if (appointment) {
+                        const mockEvent = {
+                            title: appointment.description,
+                            start: new Date(appointment.appointment_date),
+                            extendedProps: {
+                                tracking_number: appointment.tracking_number,
+                                remarks: appointment.remarks,
+                                status: appointment.status,
+                                user_name: appointment.user_name,
+                                category_name: appointment.category_name,
+                                time: appointment.time
+                            }
+                        };
+                        
+                        console.log('Created mock event:', mockEvent);
+                        
+                        // Load appointment details
+                        loadAppointmentDetails(mockEvent);
+                    } else {
+                        console.error('Appointment not found with ID:', storedAppointmentId);
+                    }
+                }
+            });
+        }
+        
+        console.log('Calendar initialized with', events.length, 'appointments');
+    }
+    });
+})();
+
+
+// Initialize modal handlers (simplified)
+function initializeModalHandlers() {
+    const modal = document.getElementById('appointmentModal');
+    if (!modal) return;
+    
+    // Listen for modal hidden event and clean up backdrop
+    modal.addEventListener('hidden.tw.modal', function() {
+        console.log('Modal hidden event triggered');
+        
+        // CRITICAL: Ensure focus is removed and state is reset when modal is hidden
+        if (modal === document.activeElement || modal.contains(document.activeElement)) {
+            console.log('Removing focus from modal on hidden event');
+            if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                document.activeElement.blur();
+            }
+            // Focus body to ensure nothing has focus
+            if (document.body && document.body.focus) {
+                document.body.focus();
+            }
+        }
+        
+        // Ensure aria-hidden is set and aria-modal is removed
+        modal.setAttribute('aria-hidden', 'true');
+        modal.removeAttribute('aria-modal');
+        
+        setTimeout(removeBackdrop, 100);
+    });
+    
+    // Listen for when modal is shown to ensure proper state
+    modal.addEventListener('show.tw.modal', function() {
+        console.log('Modal show event triggered');
+        document.body.classList.add('modal-open');
+        
+        // Ensure aria-hidden is removed when showing
+        modal.removeAttribute('aria-hidden');
+        modal.setAttribute('aria-modal', 'true');
+    });
+}
+
+// Function to show modal using Tailwind Modal (exact pattern from common.js)
+function showAppointmentModal() {
+    console.log('Showing appointment modal...');
+    
+    const el = document.querySelector('#appointmentModal');
+    if (!el) {
+        console.error('Modal element not found!');
+        return;
+    }
+    
+    // Check if modal is in DOM
+    if (!document.body.contains(el)) {
+        console.error('Modal is not in DOM!');
+        // Try to append to body if not already there
+        document.body.appendChild(el);
+        console.log('Modal appended to body');
+    }
+    
+    // Use exact pattern from common.js and show-modal.js
+    if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+        try {
+            const modal = tailwind.Modal.getOrCreateInstance(el);
+            modal.show();
+            console.log('Modal shown successfully');
+            
+            // Verify modal is visible after a short delay
+            setTimeout(function() {
+                const isVisible = el.classList.contains('show') || 
+                                 window.getComputedStyle(el).display !== 'none';
+                console.log('Modal visible check:', isVisible);
+                console.log('Modal has show class:', el.classList.contains('show'));
+                console.log('Modal display:', window.getComputedStyle(el).display);
+                
+                if (!isVisible) {
+                    console.warn('Modal not visible, attempting manual show');
+                    el.classList.add('show');
+                    el.setAttribute('aria-hidden', 'false');
+                    el.setAttribute('aria-modal', 'true');
+                }
+            }, 100);
+        } catch (error) {
+            console.error('Error showing modal:', error);
+            // Fallback: try modal_show function
+            if (typeof modal_show === 'function') {
+                modal_show('appointmentModal');
+                console.log('Modal shown via modal_show() fallback');
+            }
+        }
+    } else if (typeof modal_show === 'function') {
+        modal_show('appointmentModal');
+        console.log('Modal shown via modal_show()');
+    } else {
+        console.error('Tailwind Modal not available!');
+    }
+}
+
+// Function to close modal using Tailwind Modal (simplified)
+function closeAppointmentModal() {
+    console.log('Closing appointment modal...');
+    
+    const modal = document.getElementById('appointmentModal');
+    if (!modal) {
+        console.error('Modal element not found!');
+        removeBackdrop();
+        return;
+    }
+    
+    // CRITICAL: Remove focus from modal before closing to fix aria-hidden issue
+    if (modal === document.activeElement || modal.contains(document.activeElement)) {
+        console.log('Removing focus from modal before closing');
+        if (document.activeElement && typeof document.activeElement.blur === 'function') {
+            document.activeElement.blur();
+        }
+        // Also blur the modal itself if it has focus
+        if (modal.blur) {
+            modal.blur();
+        }
+    }
+    
+    // Use Tailwind Modal directly
+    if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+        try {
+            const modalInstance = tailwind.Modal.getOrCreateInstance(modal);
+            modalInstance.hide();
+            console.log('Modal closed via Tailwind Modal');
+            
+            // Ensure modal is properly hidden and reset after close
+            setTimeout(function() {
+                modal.setAttribute('aria-hidden', 'true');
+                modal.removeAttribute('aria-modal');
+                // Clear any focus that might remain
+                if (modal.contains(document.activeElement)) {
+                    document.body.focus();
+                }
+                console.log('Modal state reset after close');
+            }, 100);
+        } catch (error) {
+            console.error('Error closing modal:', error);
+        }
+    } else if (typeof modal_hide === 'function') {
+        modal_hide('appointmentModal');
+        console.log('Modal closed via modal_hide()');
+    } else {
+        console.error('Tailwind Modal not available!');
+    }
+    
+    // Clean up backdrop after a short delay
+    setTimeout(removeBackdrop, 100);
+}
+
+// Function to remove backdrop and restore page functionality (simplified)
+function removeBackdrop() {
+    // Remove backdrop elements
+    const backdrops = document.querySelectorAll('.modal-backdrop, [data-tw-backdrop], .backdrop');
+    backdrops.forEach(backdrop => {
+        if (backdrop && backdrop.parentNode) {
+            backdrop.remove();
+        }
+    });
+    
+    // Remove modal-open class and restore scrolling
+    document.body.classList.remove('modal-open');
+    document.documentElement.classList.remove('modal-open');
+    document.body.style.overflow = 'auto';
+    document.body.style.paddingRight = '';
+    document.documentElement.style.overflow = 'auto';
+    document.documentElement.style.paddingRight = '';
+    
+    // Restore pointer events
+    document.body.style.pointerEvents = '';
+    document.documentElement.style.pointerEvents = '';
+    
+    console.log('Backdrop removed, page functionality restored');
+}
+
+// Function to load appointment details (similar to loadFeedbackDetails)
+function loadAppointmentDetails(event) {
+    const detailsContainer = document.getElementById('appointment-details');
+    
+    // Show loading state
+    detailsContainer.innerHTML = `
+        <div class="text-center text-slate-500 py-12">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+            <p class="text-lg">Loading appointment details...</p>
+        </div>
+    `;
+    
+    // Display details immediately (remove artificial delay)
+    try {
+        displayAppointmentDetails(event);
+    } catch (error) {
+        console.error('Error displaying appointment details:', error);
+        detailsContainer.innerHTML = `
+            <div class="text-center text-red-500 py-12">
+                <p class="text-lg">Error loading appointment details</p>
+                <p class="text-sm">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Function to display appointment details (exact copy of incident modal design)
+function displayAppointmentDetails(event) {
+    const detailsContainer = document.getElementById('appointment-details');
+    
+    console.log('Displaying appointment details for event:', event);
+    console.log('Event extendedProps:', event.extendedProps);
+    
+    // Get linked data from business-management and service-management
+    const businessManagement = event.extendedProps.business_management || null;
+    const serviceManagement = event.extendedProps.service_management || null;
+    
+    // Build business management section if available
+    let businessSection = '';
+    if (businessManagement) {
+        businessSection = `
+            <div class="col-span-12 mt-4 pt-4 border-t border-slate-200">
+                <h3 class="text-lg font-semibold text-slate-700 mb-3">Business Management</h3>
+                <div class="grid grid-cols-12 gap-4">
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Business Name</label>
+                        <input type="text" class="form-control" value="${businessManagement.business_name || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Type of Business</label>
+                        <input type="text" class="form-control" value="${businessManagement.type_of_business || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Status</label>
+                        <input type="text" class="form-control" value="${businessManagement.status || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Address</label>
+                        <input type="text" class="form-control" value="${businessManagement.address || 'N/A'}" readonly>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+    
+    // Build service management section if available
+    let serviceSection = '';
+    if (serviceManagement) {
+        serviceSection = `
+            <div class="col-span-12 mt-4 pt-4 border-t border-slate-200">
+                <h3 class="text-lg font-semibold text-slate-700 mb-3">Service Management</h3>
+                <div class="grid grid-cols-12 gap-4">
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Service Type</label>
+                        <input type="text" class="form-control" value="${serviceManagement.service_type || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Category</label>
+                        <input type="text" class="form-control" value="${serviceManagement.category || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Status</label>
+                        <input type="text" class="form-control" value="${serviceManagement.status || 'N/A'}" readonly>
+                    </div>
+                    ${serviceManagement.complaint_description ? `
+                    <div class="col-span-12">
+                        <label class="form-label">Complaint Description</label>
+                        <textarea class="form-control" rows="3" readonly>${serviceManagement.complaint_description}</textarea>
+                    </div>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+    }
+    
+    detailsContainer.innerHTML = `
+        <div class="grid grid-cols-12 gap-4">
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">User</label>
+                <input type="text" class="form-control" value="${event.extendedProps.user_name || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Category</label>
+                <input type="text" class="form-control" value="${event.extendedProps.category_name || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Appointment Date</label>
+                <input type="text" class="form-control" value="${event.start ? formatAppointmentDate(event.start) : 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Appointment Time</label>
+                <input type="text" class="form-control" value="${event.extendedProps.time || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Status</label>
+                <input type="text" class="form-control" value="${event.extendedProps.status ? event.extendedProps.status.charAt(0).toUpperCase() + event.extendedProps.status.slice(1) : 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Tracking Number</label>
+                <input type="text" class="form-control" value="${event.extendedProps.tracking_number || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12">
+                <label class="form-label">Description</label>
+                <textarea class="form-control" rows="3" readonly>${event.title || 'No description provided'}</textarea>
+            </div>
+            ${event.extendedProps.remarks ? `
+            <div class="col-span-12">
+                <label class="form-label">Remarks</label>
+                <textarea class="form-control" rows="3" readonly>${event.extendedProps.remarks}</textarea>
+            </div>
+            ` : ''}
+            ${businessSection}
+            ${serviceSection}
+        </div>
+    `;
+    
+    console.log('Appointment details displayed successfully');
+}
+
+// Helper functions
+function getAppointmentStatusColor(status) {
+    switch(status) {
+        case 'pending': return 'bg-yellow-100 text-yellow-800';
+        case 'approved': return 'bg-green-100 text-green-800';
+        case 'cancelled': return 'bg-red-100 text-red-800';
+        case 'completed': return 'bg-blue-100 text-blue-800';
+        default: return 'bg-slate-100 text-slate-800';
+    }
+}
+
+function formatAppointmentDate(date) {
+    if (!date) return 'N/A';
+    
+    try {
+        const appointmentDate = new Date(date);
+        return appointmentDate.toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    } catch (error) {
+        return date.toString();
+    }
+}

@@ -1,0 +1,227 @@
+<?php
+
+namespace App\Traits;
+
+use App\Models\Notification;
+use App\Events\NotificationCreated;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+trait NotificationTrait
+{
+    /**
+     * Get all custom notifications for this user
+     */
+    public function customNotifications(): HasMany
+    {
+        return $this->hasMany(Notification::class, 'users_id', 'id');
+    }
+
+    /**
+     * Send a custom notification to this user
+     */
+    public function sendCustomNotification(string $type, string $title, string $message, int $moduleId = null): Notification
+    {
+        $notificationSettingsId = null;
+        
+        // If moduleId is provided, find the notification_settings_id for this user and module
+        if ($moduleId) {
+            $notificationSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                ->where('module_id', $moduleId)
+                ->where('status', 'active')
+                ->first();
+            
+            if ($notificationSetting) {
+                $notificationSettingsId = $notificationSetting->id;
+            }
+        }
+        
+        $notification = $this->customNotifications()->create([
+            'users_id' => $this->id,
+            'type' => $type,
+            'title' => $title,
+            'message' => $message,
+            'notification_settings_id' => $notificationSettingsId,
+            'read_at' => null,
+        ]);
+        
+        // Broadcast the notification event
+        event(new NotificationCreated($notification));
+        
+        return $notification;
+    }
+
+    /**
+     * Send success notification
+     */
+    public function notifySuccess(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('success', $title, $message, $moduleId);
+    }
+
+    /**
+     * Send error notification
+     */
+    public function notifyError(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('error', $title, $message, $moduleId);
+    }
+
+    /**
+     * Send warning notification
+     */
+    public function notifyWarning(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('warning', $title, $message, $moduleId);
+    }
+
+    /**
+     * Send info notification
+     */
+    public function notifyInfo(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('info', $title, $message, $moduleId);
+    }
+
+    /**
+     * Mark notification as read
+     */
+    public function markNotificationAsRead(int $notificationId): bool
+    {
+        $notification = $this->customNotifications()->find($notificationId);
+        
+        if ($notification && !$notification->read_at) {
+            $notification->markAsRead();
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Mark all notifications as read
+     */
+    public function markAllNotificationsAsRead(): int
+    {
+        return $this->customNotifications()
+            ->whereNull('read_at')
+            ->update(['read_at' => now()]);
+    }
+
+    /**
+     * Get unread notifications count
+     */
+    public function getUnreadNotificationsCount(): int
+    {
+        return $this->getUnreadNotifications()->count();
+    }
+
+    /**
+     * Get unread notifications filtered by notification settings
+     */
+    public function getUnreadNotifications()
+    {
+        $notifications = $this->customNotifications()
+            ->whereNull('read_at')
+            ->orderBy('created_at', 'desc')
+            ->get();
+        
+        // Filter notifications based on notification settings
+        $filteredNotifications = $notifications->filter(function($notification) {
+            // If notification has notification_settings_id, check if setting is still active
+            if ($notification->notification_settings_id) {
+                $setting = \App\Models\notification_settings::where('id', $notification->notification_settings_id)
+                    ->where('users_id', $this->id)
+                    ->where('status', 'active')
+                    ->first();
+                return $setting !== null;
+            }
+            
+            // For notifications without notification_settings_id, check by module
+            // Check if it's a chat notification
+            $isChatNotification = $notification->type === 'message' 
+                || stripos($notification->title, 'New Message') !== false;
+            
+            if ($isChatNotification) {
+                // Find chat module
+                $chatModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'Chat')
+                      ->orWhere('module_name', 'chat')
+                      ->orWhere('module_name', 'Chat Management')
+                      ->orWhere('module_name', 'chat management');
+                })->where('status', 'active')->first();
+                
+                if ($chatModule) {
+                    $hasChatSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                        ->where('module_id', $chatModule->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    return $hasChatSetting;
+                }
+                return false; // No chat module found, exclude notification
+            }
+            
+            // Check if it's a chatbot notification
+            $isChatbotNotification = stripos($notification->title, 'chatbot') !== false
+                || stripos($notification->title, 'guest message') !== false
+                || stripos($notification->message, 'chatbot') !== false;
+            
+            if ($isChatbotNotification) {
+                // Find chatbot module
+                $chatbotModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'Guest Chatbot')
+                      ->orWhere('module_name', 'guest chatbot')
+                      ->orWhere('module_name', 'Chatbot')
+                      ->orWhere('module_name', 'chatbot')
+                      ->orWhere('module_name', 'Chat Bot')
+                      ->orWhere('module_name', 'chat bot');
+                })->where('status', 'active')->first();
+                
+                if ($chatbotModule) {
+                    $hasChatbotSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                        ->where('module_id', $chatbotModule->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    return $hasChatbotSetting;
+                }
+                return false; // No chatbot module found, exclude notification
+            }
+            
+            // For other notifications without notification_settings_id, exclude them
+            return false;
+        });
+        
+        // Return a query builder-like object for compatibility
+        $ids = $filteredNotifications->pluck('id')->toArray();
+        
+        // If no filtered notifications, return empty query
+        if (empty($ids)) {
+            return $this->customNotifications()
+                ->whereNull('read_at')
+                ->whereRaw('1 = 0') // Always false condition
+                ->orderBy('created_at', 'desc');
+        }
+        
+        return $this->customNotifications()
+            ->whereNull('read_at')
+            ->whereIn('id', $ids)
+            ->orderBy('created_at', 'desc');
+    }
+
+    /**
+     * Get recent notifications
+     */
+    public function getRecentNotifications(int $limit = 10)
+    {
+        return $this->customNotifications()->orderBy('created_at', 'desc')->limit($limit);
+    }
+
+    /**
+     * Delete old notifications
+     */
+    public function deleteOldNotifications(int $days = 30): int
+    {
+        return $this->customNotifications()
+            ->where('created_at', '<', now()->subDays($days))
+            ->delete();
+    }
+}

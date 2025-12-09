@@ -1,0 +1,941 @@
+// Appointment Calendar Module - All events are timed events displayed in time slots
+console.log('=== APPOINTMENT CALENDAR SCRIPT LOADING ===');
+
+// Wait for dependencies to be available
+(function checkAndInit() {
+    if (typeof jQuery === 'undefined' || typeof $ === 'undefined') {
+        console.log('Waiting for jQuery...');
+        setTimeout(checkAndInit, 100);
+        return;
+    }
+    
+    if (typeof FullCalendar === 'undefined') {
+        console.log('Waiting for FullCalendar...');
+        setTimeout(checkAndInit, 100);
+        return;
+    }
+    
+    if (typeof tailwind === 'undefined' || !tailwind.Modal) {
+        console.log('Waiting for Tailwind Modal...');
+        setTimeout(checkAndInit, 100);
+        return;
+    }
+    
+    console.log('=== ALL DEPENDENCIES LOADED ===');
+    
+    $(document).ready(function() {
+        console.log('=== INITIALIZING APPOINTMENT CALENDAR ===');
+        
+        // Clear any existing calendar instance
+        const existingCalendarEl = $("#calendar")[0];
+        if (existingCalendarEl) {
+            if (existingCalendarEl.classList && existingCalendarEl.classList.contains('fc')) {
+                existingCalendarEl.innerHTML = '';
+                Array.from(existingCalendarEl.classList).forEach(cls => {
+                    if (cls.startsWith('fc-')) {
+                        existingCalendarEl.classList.remove(cls);
+                    }
+                });
+            }
+        }
+        
+        if ($("#calendar").length) {
+            // Clear calendar element
+            const calendarElement = $("#calendar")[0];
+            if (calendarElement) {
+                calendarElement.innerHTML = '';
+                calendarElement.className = 'full-calendar';
+                Array.from(calendarElement.attributes).forEach(attr => {
+                    if (attr.name.startsWith('data-') || attr.name.startsWith('_')) {
+                        calendarElement.removeAttribute(attr.name);
+                    }
+                });
+            }
+            
+            // Initialize modal early
+            const appointmentModal = document.getElementById('appointmentModal');
+            if (appointmentModal && typeof tailwind !== 'undefined' && tailwind.Modal) {
+                try {
+                    const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                    window.appointmentModalInstance = modalInstance;
+                } catch (error) {
+                    console.error('Error initializing modal early:', error);
+                }
+            }
+            
+            initializeModalHandlers();
+            
+            // Format appointments for FullCalendar - all events are timed events
+            const formatAppointmentsForCalendar = (appointments) => {
+                if (!Array.isArray(appointments)) {
+                    console.warn('Appointments is not an array:', appointments);
+                    return [];
+                }
+                
+                console.log('Formatting appointments for calendar:', appointments.length);
+                
+                return appointments.map(appointment => {
+                    if (!appointment || typeof appointment !== 'object') {
+                        console.error('Invalid appointment object:', appointment);
+                        return null;
+                    }
+                    
+                    const appointmentId = appointment.id || appointment.ID || null;
+                    const appointmentTitle = appointment.description || appointment.title || 'Untitled Appointment';
+                    const appointmentDate = appointment.appointment_date || appointment.date || null;
+                    const appointmentTime = appointment.time || appointment.scheduled_time || appointment.appointment_time || null;
+                    const businessManagement = appointment.business_management || null;
+                    const serviceManagement = appointment.service_management || null;
+                    
+                    if (!appointmentId) {
+                        console.warn('Skipping appointment without ID:', appointment);
+                        return null;
+                    }
+                    
+                    // Determine color based on status
+                    let color;
+                    switch((appointment.status || '').toLowerCase()) {
+                        case 'pending':
+                            color = '#f59e0b';
+                            break;
+                        case 'approved':
+                            color = '#10b981';
+                            break;
+                        case 'cancelled':
+                            color = '#ef4444';
+                            break;
+                        case 'completed':
+                            color = '#3b82f6';
+                            break;
+                        default:
+                            color = '#6b7280';
+                    }
+                    
+                    // Process date
+                    let datePart = appointmentDate;
+                    if (!datePart) {
+                        const today = new Date();
+                        datePart = today.toISOString().split('T')[0];
+                        console.warn('Using today as fallback date for appointment:', appointmentId);
+                    } else if (typeof datePart === 'string') {
+                        if (datePart.includes('T') || datePart.includes(' ')) {
+                            datePart = datePart.split('T')[0].split(' ')[0];
+                        }
+                        if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
+                            try {
+                                const parsedDate = new Date(datePart);
+                                if (!isNaN(parsedDate.getTime())) {
+                                    datePart = parsedDate.toISOString().split('T')[0];
+                                } else {
+                                    const today = new Date();
+                                    datePart = today.toISOString().split('T')[0];
+                                }
+                            } catch (e) {
+                                const today = new Date();
+                                datePart = today.toISOString().split('T')[0];
+                            }
+                        }
+                    } else if (datePart instanceof Date) {
+                        if (isNaN(datePart.getTime())) {
+                            const today = new Date();
+                            datePart = today.toISOString().split('T')[0];
+                        } else {
+                            datePart = datePart.toISOString().split('T')[0];
+                        }
+                    } else {
+                        const today = new Date();
+                        datePart = today.toISOString().split('T')[0];
+                    }
+                    
+                    // Process time - all events must have a time component
+                    let startDateTime = datePart;
+                    let hasTime = false;
+                    
+                    if (appointmentTime && typeof appointmentTime === 'string' && appointmentTime.trim() !== '') {
+                        let timeStr = appointmentTime.trim();
+                        let hours = 0;
+                        let minutes = 0;
+                        let seconds = 0;
+                        let timeParsed = false;
+                        
+                        try {
+                            timeStr = timeStr.replace(/\s+/g, ' ').trim();
+                            
+                            // Check for 12-hour format with AM/PM
+                            const twelveHourMatch = timeStr.match(/(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM|am|pm)/i);
+                            if (twelveHourMatch) {
+                                hours = parseInt(twelveHourMatch[1], 10);
+                                minutes = parseInt(twelveHourMatch[2] || '0', 10) || 0;
+                                const ampm = twelveHourMatch[3].toUpperCase();
+                                
+                                if (ampm === 'PM' && hours !== 12) {
+                                    hours += 12;
+                                } else if (ampm === 'AM' && hours === 12) {
+                                    hours = 0;
+                                }
+                                
+                                timeParsed = true;
+                            } else {
+                                // Parse 24-hour format
+                                const timeParts = timeStr.split(':');
+                                if (timeParts.length >= 2) {
+                                    hours = parseInt(timeParts[0], 10) || 0;
+                                    minutes = parseInt(timeParts[1], 10) || 0;
+                                    seconds = timeParts.length >= 3 ? (parseInt(timeParts[2], 10) || 0) : 0;
+                                    timeParsed = true;
+                                } else if (timeParts.length === 1 && /^\d{1,2}$/.test(timeStr.trim())) {
+                                    hours = parseInt(timeStr.trim(), 10) || 0;
+                                    minutes = 0;
+                                    seconds = 0;
+                                    timeParsed = true;
+                                }
+                            }
+                            
+                            // Validate and format time
+                            if (timeParsed && !isNaN(hours) && !isNaN(minutes) && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
+                                const formattedTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                                startDateTime = datePart + 'T' + formattedTime;
+                                hasTime = true;
+                            } else {
+                                startDateTime = datePart + 'T00:00:00';
+                                hasTime = true;
+                            }
+                        } catch (e) {
+                            console.error('Error parsing time:', e);
+                            startDateTime = datePart + 'T00:00:00';
+                            hasTime = true;
+                        }
+                    } else {
+                        // No time specified, use default 9:00 AM
+                        startDateTime = datePart + 'T09:00:00';
+                        hasTime = true;
+                    }
+                    
+                    // Ensure startDateTime always has time component
+                    if (!startDateTime.includes('T')) {
+                        startDateTime = datePart + 'T09:00:00';
+                        hasTime = true;
+                    }
+                    
+                    // Create event object - all events are timed events
+                    const eventObj = {
+                        id: appointmentId,
+                        title: appointmentTitle,
+                        start: startDateTime,
+                        allDay: false,
+                        backgroundColor: color,
+                        borderColor: color,
+                        textColor: '#ffffff',
+                        className: 'appointment-event',
+                        extendedProps: {
+                            tracking_number: appointment.tracking_number || appointment.trackingNumber || null,
+                            remarks: appointment.remarks || null,
+                            status: appointment.status || 'pending',
+                            user_id: appointment.user_id || appointment.users_id || null,
+                            user_name: appointment.user_name || appointment.userName || 'N/A',
+                            category_name: appointment.category_name || appointment.categoryName || 'N/A',
+                            time: appointmentTime || null,
+                            appointment_date: appointmentDate || null,
+                            business_management: businessManagement,
+                            service_management: serviceManagement,
+                            appointment_management_id: appointmentId
+                        }
+                    };
+                    
+                    console.log('Created event:', {
+                        id: eventObj.id,
+                        title: eventObj.title,
+                        start: eventObj.start,
+                        hasTime: hasTime
+                    });
+                    
+                    return eventObj;
+                }).filter(event => event !== null);
+            };
+            
+            // Initialize draggable for sidebar events
+            if ($("#calendar-events").length && typeof FullCalendar !== 'undefined' && FullCalendar.Draggable) {
+                new FullCalendar.Draggable($("#calendar-events")[0], {
+                    itemSelector: ".event",
+                    eventData: function (eventEl) {
+                        return {
+                            title: $(eventEl).find(".event__title").html(),
+                            duration: {
+                                days: parseInt($(eventEl).find(".event__days").text())
+                            }
+                        };
+                    }
+                });
+            }
+            
+            // Create FullCalendar instance
+            const calendarEl = $("#calendar")[0];
+            if (!calendarEl) {
+                console.error('ERROR: Calendar element not found!');
+                return;
+            }
+            
+            // Function to aggressively remove all-day elements - define BEFORE calendar creation
+            window.removeAllDayElements = function(container) {
+                if (!container) return;
+                
+                // Remove all all-day related elements
+                const allDaySelectors = [
+                    '.fc-timegrid-all-day',
+                    '.fc-timegrid-all-day-container',
+                    '.fc-timegrid-divider',
+                    '.fc-timegrid-all-day-table',
+                    '.fc-timegrid-all-day-frame',
+                    '.fc-timegrid-all-day-col',
+                    '.fc-timegrid-all-day-header',
+                    '.fc-timegrid-all-day-header-cell',
+                    '[class*="fc-timegrid-all-day"]',
+                    '[class*="all-day"]'
+                ];
+                
+                allDaySelectors.forEach(function(selector) {
+                    const elements = container.querySelectorAll(selector);
+                    elements.forEach(function(el) {
+                        el.style.display = 'none';
+                        el.style.height = '0';
+                        el.style.minHeight = '0';
+                        el.style.maxHeight = '0';
+                        el.style.width = '0';
+                        el.style.visibility = 'hidden';
+                        el.style.opacity = '0';
+                        el.style.position = 'absolute';
+                        el.style.left = '-9999px';
+                        el.style.lineHeight = '0';
+                        el.style.fontSize = '0';
+                        el.style.padding = '0';
+                        el.style.margin = '0';
+                        el.style.border = 'none';
+                        el.style.overflow = 'hidden';
+                        
+                        // Remove all children
+                        while (el.firstChild) {
+                            el.removeChild(el.firstChild);
+                        }
+                    });
+                });
+                
+                // Remove any text nodes containing "ALL DAY" or "all-day"
+                const walker = document.createTreeWalker(
+                    container,
+                    NodeFilter.SHOW_TEXT,
+                    null,
+                    false
+                );
+                let node;
+                while (node = walker.nextNode()) {
+                    if (node.textContent && /ALL\s*DAY|all\s*day|all-day/i.test(node.textContent)) {
+                        node.textContent = '';
+                        if (node.parentNode) {
+                            node.parentNode.removeChild(node);
+                        }
+                    }
+                }
+            };
+            
+            let calendar;
+            try {
+                calendar = new FullCalendar.Calendar(calendarEl, {
+                    droppable: false,
+                    headerToolbar: {
+                        left: "prev,next today",
+                        center: "title",
+                        right: "dayGridMonth,timeGridWeek,timeGridDay,listWeek"
+                    },
+                    navLinks: true,
+                    editable: false,
+                    dayMaxEvents: true,
+                    allDaySlot: false,
+                    allDayText: '',
+                    slotMinTime: '00:00:00',
+                    slotMaxTime: '24:00:00',
+                    slotDuration: '00:30:00',
+                    slotLabelInterval: '01:00:00',
+                    eventDisplay: 'block',
+                    views: {
+                        timeGridWeek: {
+                            allDaySlot: false,
+                            allDayText: '',
+                            slotMinTime: '00:00:00',
+                            slotMaxTime: '24:00:00',
+                            slotLabelInterval: '01:00:00',
+                            slotDuration: '00:30:00'
+                        },
+                        timeGridDay: {
+                            allDaySlot: false,
+                            allDayText: '',
+                            slotMinTime: '00:00:00',
+                            slotMaxTime: '24:00:00',
+                            slotLabelInterval: '01:00:00',
+                            slotDuration: '00:30:00'
+                        },
+                        dayGridMonth: {
+                            eventTimeFormat: {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                hour12: true
+                            }
+                        },
+                        listWeek: {}
+                    },
+                    events: function(fetchInfo, successCallback, failureCallback) {
+                        console.log('=== FETCHING APPOINTMENTS FROM DATABASE ===');
+                        
+                        fetch('/appointment-calendar/appointments', {
+                            method: 'GET',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest'
+                            }
+                        })
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error('Network response was not ok');
+                            }
+                            return response.json();
+                        })
+                        .then(appointments => {
+                            console.log('=== APPOINTMENTS FETCHED ===');
+                            console.log('Total appointments:', appointments.length);
+                            
+                            const formattedEvents = formatAppointmentsForCalendar(appointments);
+                            console.log('=== FORMATTED EVENTS ===');
+                            console.log('Total formatted events:', formattedEvents.length);
+                            
+                            successCallback(formattedEvents);
+                        })
+                        .catch(error => {
+                            console.error('Error fetching appointments:', error);
+                            const fallbackAppointments = window.appointmentsData || [];
+                            const formattedEvents = formatAppointmentsForCalendar(fallbackAppointments);
+                            successCallback(formattedEvents);
+                            failureCallback(error);
+                        });
+                    },
+                    eventClick: function(info) {
+                        console.log('=== EVENT CLICKED ===');
+                        
+                        if (info.jsEvent) {
+                            info.jsEvent.preventDefault();
+                            info.jsEvent.stopPropagation();
+                        }
+                        
+                        const event = info.event;
+                        console.log('Appointment clicked:', event);
+                        
+                        if (!event || !event.extendedProps) {
+                            console.error('Event object is missing required data!', event);
+                            alert('Error: Could not load appointment details. Please try again.');
+                            return;
+                        }
+                        
+                        const appointmentModal = document.getElementById('appointmentModal');
+                        if (!appointmentModal) {
+                            console.error('Appointment modal element not found!');
+                            alert('Error: Modal element not found. Please refresh the page.');
+                            return;
+                        }
+                        
+                        appointmentModal.removeAttribute('data-current-appointment-id');
+                        appointmentModal.setAttribute('data-details-loaded', 'true');
+                        
+                        try {
+                            loadAppointmentDetails(event);
+                        } catch (error) {
+                            console.error('Error loading appointment details:', error);
+                            alert('Error loading appointment details: ' + error.message);
+                            return;
+                        }
+                        
+                        appointmentModal.removeAttribute('aria-hidden');
+                        appointmentModal.style.display = '';
+                        appointmentModal.style.visibility = '';
+                        appointmentModal.style.opacity = '';
+                        
+                        if (appointmentModal === document.activeElement || appointmentModal.contains(document.activeElement)) {
+                            if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                                document.activeElement.blur();
+                            }
+                        }
+                        
+                        setTimeout(function() {
+                            try {
+                                if (typeof tailwind !== 'undefined' && tailwind.Modal && appointmentModal) {
+                                    const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                                    modalInstance.show();
+                                    
+                                    setTimeout(function() {
+                                        appointmentModal.removeAttribute('aria-hidden');
+                                        appointmentModal.setAttribute('aria-modal', 'true');
+                                    }, 50);
+                                } else {
+                                    showAppointmentModal();
+                                }
+                            } catch (error) {
+                                console.error('Error showing modal:', error);
+                                alert('Error showing modal: ' + error.message);
+                            }
+                        }, 100);
+                    },
+                    eventDidMount: function(info) {
+                        info.el.title = `${info.event.title}\nStatus: ${info.event.extendedProps.status || 'N/A'}${info.event.extendedProps.tracking_number ? '\nTracking #: ' + info.event.extendedProps.tracking_number : ''}`;
+                        info.el.setAttribute('data-event-id', info.event.id);
+                        info.el.setAttribute('data-event-title', info.event.title);
+                    },
+                    dateClick: function(info) {
+                        console.log('Date clicked:', info.dateStr);
+                    },
+                    drop: function (info) {
+                        if ($("#checkbox-events").length && $("#checkbox-events")[0].checked) {
+                            $(info.draggedEl).parent().remove();
+                            if ($("#calendar-events").children().length == 1) {
+                                $("#calendar-no-events").removeClass("hidden");
+                            }
+                        }
+                    },
+                    viewDidMount: function(info) {
+                        // Force remove all-day row when view changes
+                        setTimeout(function() {
+                            if (window.removeAllDayElements) {
+                                window.removeAllDayElements(calendarEl);
+                            }
+                        }, 50);
+                        
+                        // Also remove after a longer delay
+                        setTimeout(function() {
+                            if (window.removeAllDayElements) {
+                                window.removeAllDayElements(calendarEl);
+                            }
+                        }, 200);
+                    }
+                });
+                
+                console.log('Rendering calendar...');
+                calendar.render();
+                
+                console.log('=== CALENDAR RENDERED ===');
+                console.log('Total events loaded:', calendar.getEvents().length);
+                
+                window.appointmentCalendar = calendar;
+                
+                // Remove all-day elements immediately after render
+                setTimeout(function() {
+                    window.removeAllDayElements(calendarEl);
+                }, 100);
+                
+                // Remove all-day elements after a longer delay (in case of async rendering)
+                setTimeout(function() {
+                    window.removeAllDayElements(calendarEl);
+                }, 500);
+                
+                // Continuously monitor and remove all-day elements (runs every 1 second)
+                const allDayCleanupInterval = setInterval(function() {
+                    window.removeAllDayElements(calendarEl);
+                }, 1000);
+                
+                // Store interval ID for potential cleanup
+                window.allDayCleanupInterval = allDayCleanupInterval;
+                
+                // Add event delegation for calendar clicks
+                if (calendarEl) {
+                    const calendarClickHandler = function(e) {
+                        let clickedEvent = e.target.closest('.fc-event');
+                        
+                        if (!clickedEvent) {
+                            let current = e.target;
+                            while (current && current !== calendarEl) {
+                                if (current.classList && current.classList.contains('fc-event')) {
+                                    clickedEvent = current;
+                                    break;
+                                }
+                                current = current.parentElement;
+                            }
+                        }
+                        
+                        if (clickedEvent) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            
+                            let eventId = clickedEvent.getAttribute('data-event-id');
+                            let matchingEvent = null;
+                            
+                            if (eventId) {
+                                matchingEvent = calendar.getEventById(eventId);
+                            }
+                            
+                            if (!matchingEvent) {
+                                const eventTitle = clickedEvent.textContent?.trim() || 
+                                                 clickedEvent.querySelector('.fc-event-title')?.textContent?.trim();
+                                const allEvents = calendar.getEvents();
+                                matchingEvent = allEvents.find(ev => {
+                                    if (eventTitle) {
+                                        return ev.title === eventTitle || 
+                                               clickedEvent.textContent.includes(ev.title) ||
+                                               (ev.id && clickedEvent.getAttribute('data-event-id') === String(ev.id));
+                                    }
+                                    return false;
+                                });
+                            }
+                            
+                            if (matchingEvent) {
+                                const appointmentModal = document.getElementById('appointmentModal');
+                                if (appointmentModal) {
+                                    appointmentModal.removeAttribute('data-current-appointment-id');
+                                    appointmentModal.setAttribute('data-details-loaded', 'true');
+                                    appointmentModal.removeAttribute('aria-hidden');
+                                    appointmentModal.style.display = '';
+                                    appointmentModal.style.visibility = '';
+                                    appointmentModal.style.opacity = '';
+                                    
+                                    if (appointmentModal === document.activeElement || appointmentModal.contains(document.activeElement)) {
+                                        if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                                            document.activeElement.blur();
+                                        }
+                                    }
+                                    
+                                    loadAppointmentDetails(matchingEvent);
+                                    setTimeout(() => {
+                                        if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+                                            const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                                            modalInstance.show();
+                                            setTimeout(() => {
+                                                appointmentModal.removeAttribute('aria-hidden');
+                                                appointmentModal.setAttribute('aria-modal', 'true');
+                                            }, 50);
+                                        }
+                                    }, 100);
+                                }
+                            }
+                        }
+                    };
+                    
+                    calendarEl.addEventListener('click', calendarClickHandler, true);
+                }
+            } catch (error) {
+                console.error('ERROR CREATING CALENDAR:', error);
+                alert('Error initializing calendar. Please check the console for details.');
+                return;
+            }
+            
+            // Handle view button clicks in sidebar
+            if (appointmentModal) {
+                document.addEventListener('click', function(e) {
+                    const eyeIcon = e.target.closest('.view-appointment-btn');
+                    if (eyeIcon) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        
+                        const appointmentId = eyeIcon.getAttribute('data-appointment-id');
+                        appointmentModal.setAttribute('data-current-appointment-id', appointmentId);
+                        
+                        setTimeout(function() {
+                            try {
+                                if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+                                    const modalInstance = tailwind.Modal.getOrCreateInstance(appointmentModal);
+                                    modalInstance.show();
+                                }
+                            } catch (error) {
+                                console.error('Error showing modal:', error);
+                            }
+                        }, 50);
+                    }
+                });
+                
+                appointmentModal.addEventListener('show.tw.modal', function() {
+                    if (appointmentModal.getAttribute('data-details-loaded') === 'true') {
+                        appointmentModal.removeAttribute('data-details-loaded');
+                        return;
+                    }
+                    
+                    const storedAppointmentId = appointmentModal.getAttribute('data-current-appointment-id');
+                    if (storedAppointmentId) {
+                        const appointments = window.appointmentsData || [];
+                        const appointment = appointments.find(a => a.id == storedAppointmentId);
+                        
+                        if (appointment) {
+                            const mockEvent = {
+                                title: appointment.description,
+                                start: new Date(appointment.appointment_date),
+                                extendedProps: {
+                                    tracking_number: appointment.tracking_number,
+                                    remarks: appointment.remarks,
+                                    status: appointment.status,
+                                    user_name: appointment.user_name,
+                                    category_name: appointment.category_name,
+                                    time: appointment.time
+                                }
+                            };
+                            
+                            loadAppointmentDetails(mockEvent);
+                        }
+                    }
+                });
+            }
+            
+            console.log('Calendar initialization complete');
+        }
+    });
+})();
+
+// Initialize modal handlers
+function initializeModalHandlers() {
+    const modal = document.getElementById('appointmentModal');
+    if (!modal) return;
+    
+    modal.addEventListener('hidden.tw.modal', function() {
+        if (modal === document.activeElement || modal.contains(document.activeElement)) {
+            if (document.activeElement && typeof document.activeElement.blur === 'function') {
+                document.activeElement.blur();
+            }
+            if (document.body && document.body.focus) {
+                document.body.focus();
+            }
+        }
+        
+        modal.setAttribute('aria-hidden', 'true');
+        modal.removeAttribute('aria-modal');
+        setTimeout(removeBackdrop, 100);
+    });
+    
+    modal.addEventListener('show.tw.modal', function() {
+        document.body.classList.add('modal-open');
+        modal.removeAttribute('aria-hidden');
+        modal.setAttribute('aria-modal', 'true');
+    });
+}
+
+// Show modal function
+function showAppointmentModal() {
+    const el = document.querySelector('#appointmentModal');
+    if (!el) {
+        console.error('Modal element not found!');
+        return;
+    }
+    
+    if (!document.body.contains(el)) {
+        document.body.appendChild(el);
+    }
+    
+    if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+        try {
+            const modal = tailwind.Modal.getOrCreateInstance(el);
+            modal.show();
+        } catch (error) {
+            console.error('Error showing modal:', error);
+            if (typeof modal_show === 'function') {
+                modal_show('appointmentModal');
+            }
+        }
+    } else if (typeof modal_show === 'function') {
+        modal_show('appointmentModal');
+    }
+}
+
+// Close modal function
+function closeAppointmentModal() {
+    const modal = document.getElementById('appointmentModal');
+    if (!modal) {
+        removeBackdrop();
+        return;
+    }
+    
+    if (modal === document.activeElement || modal.contains(document.activeElement)) {
+        if (document.activeElement && typeof document.activeElement.blur === 'function') {
+            document.activeElement.blur();
+        }
+        if (modal.blur) {
+            modal.blur();
+        }
+    }
+    
+    if (typeof tailwind !== 'undefined' && tailwind.Modal) {
+        try {
+            const modalInstance = tailwind.Modal.getOrCreateInstance(modal);
+            modalInstance.hide();
+            
+            setTimeout(function() {
+                modal.setAttribute('aria-hidden', 'true');
+                modal.removeAttribute('aria-modal');
+                if (modal.contains(document.activeElement)) {
+                    document.body.focus();
+                }
+            }, 100);
+        } catch (error) {
+            console.error('Error closing modal:', error);
+        }
+    } else if (typeof modal_hide === 'function') {
+        modal_hide('appointmentModal');
+    }
+    
+    setTimeout(removeBackdrop, 100);
+}
+
+// Remove backdrop function
+function removeBackdrop() {
+    const backdrops = document.querySelectorAll('.modal-backdrop, [data-tw-backdrop], .backdrop');
+    backdrops.forEach(backdrop => {
+        if (backdrop && backdrop.parentNode) {
+            backdrop.remove();
+        }
+    });
+    
+    document.body.classList.remove('modal-open');
+    document.documentElement.classList.remove('modal-open');
+    document.body.style.overflow = 'auto';
+    document.body.style.paddingRight = '';
+    document.documentElement.style.overflow = 'auto';
+    document.documentElement.style.paddingRight = '';
+    document.body.style.pointerEvents = '';
+    document.documentElement.style.pointerEvents = '';
+}
+
+// Load appointment details
+function loadAppointmentDetails(event) {
+    const detailsContainer = document.getElementById('appointment-details');
+    
+    detailsContainer.innerHTML = `
+        <div class="text-center text-slate-500 py-12">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto mb-4"></div>
+            <p class="text-lg">Loading appointment details...</p>
+        </div>
+    `;
+    
+    try {
+        displayAppointmentDetails(event);
+    } catch (error) {
+        console.error('Error displaying appointment details:', error);
+        detailsContainer.innerHTML = `
+            <div class="text-center text-red-500 py-12">
+                <p class="text-lg">Error loading appointment details</p>
+                <p class="text-sm">${error.message}</p>
+            </div>
+        `;
+    }
+}
+
+// Display appointment details
+function displayAppointmentDetails(event) {
+    const detailsContainer = document.getElementById('appointment-details');
+    
+    const businessManagement = event.extendedProps.business_management || null;
+    const serviceManagement = event.extendedProps.service_management || null;
+    
+    let businessSection = '';
+    if (businessManagement) {
+        businessSection = `
+            <div class="col-span-12 mt-4 pt-4 border-t border-slate-200">
+                <h3 class="text-lg font-semibold text-slate-700 mb-3">Business Management</h3>
+                <div class="grid grid-cols-12 gap-4">
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Business Name</label>
+                        <input type="text" class="form-control" value="${businessManagement.business_name || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Type of Business</label>
+                        <input type="text" class="form-control" value="${businessManagement.type_of_business || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Status</label>
+                        <input type="text" class="form-control" value="${businessManagement.status || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Address</label>
+                        <input type="text" class="form-control" value="${businessManagement.address || 'N/A'}" readonly>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+    
+    let serviceSection = '';
+    if (serviceManagement) {
+        serviceSection = `
+            <div class="col-span-12 mt-4 pt-4 border-t border-slate-200">
+                <h3 class="text-lg font-semibold text-slate-700 mb-3">Service Management</h3>
+                <div class="grid grid-cols-12 gap-4">
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Service Type</label>
+                        <input type="text" class="form-control" value="${serviceManagement.service_type || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Category</label>
+                        <input type="text" class="form-control" value="${serviceManagement.category || 'N/A'}" readonly>
+                    </div>
+                    <div class="col-span-12 md:col-span-6">
+                        <label class="form-label">Status</label>
+                        <input type="text" class="form-control" value="${serviceManagement.status || 'N/A'}" readonly>
+                    </div>
+                    ${serviceManagement.complaint_description ? `
+                    <div class="col-span-12">
+                        <label class="form-label">Complaint Description</label>
+                        <textarea class="form-control" rows="3" readonly>${serviceManagement.complaint_description}</textarea>
+                    </div>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+    }
+    
+    detailsContainer.innerHTML = `
+        <div class="grid grid-cols-12 gap-4">
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">User</label>
+                <input type="text" class="form-control" value="${event.extendedProps.user_name || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Category</label>
+                <input type="text" class="form-control" value="${event.extendedProps.category_name || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Appointment Date</label>
+                <input type="text" class="form-control" value="${event.start ? formatAppointmentDate(event.start) : 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Appointment Time</label>
+                <input type="text" class="form-control" value="${event.extendedProps.time || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Status</label>
+                <input type="text" class="form-control" value="${event.extendedProps.status ? event.extendedProps.status.charAt(0).toUpperCase() + event.extendedProps.status.slice(1) : 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12 md:col-span-6">
+                <label class="form-label">Tracking Number</label>
+                <input type="text" class="form-control" value="${event.extendedProps.tracking_number || 'N/A'}" readonly>
+            </div>
+            <div class="col-span-12">
+                <label class="form-label">Description</label>
+                <textarea class="form-control" rows="3" readonly>${event.title || 'No description provided'}</textarea>
+            </div>
+            ${event.extendedProps.remarks ? `
+            <div class="col-span-12">
+                <label class="form-label">Remarks</label>
+                <textarea class="form-control" rows="3" readonly>${event.extendedProps.remarks}</textarea>
+            </div>
+            ` : ''}
+            ${businessSection}
+            ${serviceSection}
+        </div>
+    `;
+}
+
+// Helper function to format appointment date
+function formatAppointmentDate(date) {
+    if (!date) return 'N/A';
+    
+    try {
+        const appointmentDate = new Date(date);
+        return appointmentDate.toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    } catch (error) {
+        return date.toString();
+    }
+}

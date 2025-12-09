@@ -1,0 +1,643 @@
+<?php
+
+namespace App\Http\Controllers\businessmanagement;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\business_management_list as Business;
+use App\Models\User;
+use App\Models\module;
+use App\Models\notification_settings;
+use Illuminate\Validation\Rule;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
+
+class BusinessManagementController extends Controller
+{
+    public function __construct()
+    {
+        \Log::info('BusinessManagementController instantiated');
+    }
+
+    public function index()
+    {
+        \Log::info('BusinessManagementController index method called');
+        
+        // Get per_page from request, default to 12
+        $perPage = request('per_page', 12);
+        
+        $businesses = Business::with('user')->latest()->paginate($perPage);
+        $owners = User::select('id','name')->orderBy('name')->get();
+        
+        // Get unique statuses from database
+        $statuses = Business::select('status')
+            ->distinct()
+            ->whereNotNull('status')
+            ->pluck('status')
+            ->sort()
+            ->values();
+        
+        // Get Application For Certification template path
+        $certificationTemplatePath = null;
+        $templateDirectory = storage_path('business_templates');
+        if (is_dir($templateDirectory)) {
+            $files = glob($templateDirectory . '/*');
+            foreach ($files as $file) {
+                if (is_file($file)) {
+                    $fileName = basename($file);
+                    if (strpos($fileName, 'application_for_certification') === 0) {
+                        $certificationTemplatePath = $file;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return view('business-management.business-management', compact('businesses', 'owners', 'statuses', 'certificationTemplatePath'));
+    }
+
+    public function show(Business $business)
+    {
+        return response()->json($business->load('user'));
+    }
+
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'user_id' => ['required', 'exists:users,id'],
+            'type_of_business' => ['required', 'string', 'max:255'],
+            'business_name' => ['required', 'string', 'max:255'],
+            'business_clearance' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:15360'],
+            'address' => ['nullable', 'string', 'max:255'],
+            'status' => ['required', Rule::in(['pending', 'approved', 'declined'])],
+            'reason' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        // Handle file upload
+        if ($request->hasFile('business_clearance')) {
+            $file = $request->file('business_clearance');
+            $filename = 'clearance_' . time() . '_' . $request->user_id . '.' . $file->getClientOriginalExtension();
+            // Store file and save full path in database
+            $path = $file->storeAs('business-clearances', $filename, 'public');
+            $validated['business_clearance'] = $path; // Store full path: business-clearances/filename
+        }
+
+        // Set default status to pending if not provided
+        if (!isset($validated['status'])) {
+            $validated['status'] = 'pending';
+        }
+
+        $business = Business::create($validated);
+        
+        // Send notifications to Admin and Occupancy Manager when a business is added
+        try {
+            $this->sendBusinessAddedNotifications($business);
+        } catch (\Exception $e) {
+            Log::error('Failed to send business added notifications: ' . $e->getMessage(), [
+                'business_id' => $business->id,
+                'error' => $e->getTraceAsString()
+            ]);
+            // Don't fail the business creation if notification fails
+        }
+        
+        return response()->json(['message' => 'Business saved', 'id' => $business->id], 201);
+    }
+
+    public function update(Request $request, Business $business)
+    {
+        $validated = $request->validate([
+            'user_id' => ['required', 'exists:users,id'],
+            'type_of_business' => ['required', 'string', 'max:255'],
+            'business_name' => ['required', 'string', 'max:255'],
+            'business_clearance' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:15360'],
+            'address' => ['nullable', 'string', 'max:255'],
+            'status' => ['required', Rule::in(['pending', 'approved', 'declined'])],
+            'reason' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        // Handle file upload
+        if ($request->hasFile('business_clearance')) {
+            // Delete old file if exists
+            if ($business->business_clearance && Storage::disk('public')->exists($business->business_clearance)) {
+                Storage::disk('public')->delete($business->business_clearance);
+            }
+            
+            $file = $request->file('business_clearance');
+            $filename = 'clearance_' . time() . '_' . $request->user_id . '.' . $file->getClientOriginalExtension();
+            // Store file and save full path in database
+            $path = $file->storeAs('business-clearances', $filename, 'public');
+            $validated['business_clearance'] = $path; // Store full path: business-clearances/filename
+        }
+
+        $business->update($validated);
+        return response()->json(['message' => 'Business updated']);
+    }
+
+    public function updateStatus(Request $request, Business $business)
+    {
+        try {
+            \Log::info('updateStatus method called', [
+                'business_id' => $business->id ?? 'null',
+                'business_exists' => $business ? 'yes' : 'no',
+                'request_data' => $request->all(),
+                'request_method' => $request->method(),
+                'user_id' => auth()->id()
+            ]);
+            
+            $validated = $request->validate([
+                'status' => ['required', Rule::in(['pending', 'approved', 'declined'])],
+                'reason' => ['nullable', 'string', 'max:500'],
+            ]);
+            
+            \Log::info('Validation passed', ['validated_data' => $validated]);
+            
+            $oldStatus = $business->status;
+            $business->status = $validated['status'];
+            if (isset($validated['reason'])) {
+                $business->reason = $validated['reason'];
+            }
+            
+            \Log::info('About to save business', [
+                'business_id' => $business->id,
+                'old_status' => $oldStatus,
+                'new_status' => $business->status,
+                'new_reason' => $business->reason ?? 'null'
+            ]);
+            
+            $business->save();
+            
+            \Log::info('Business saved successfully', [
+                'business_id' => $business->id,
+                'updated_status' => $business->status
+            ]);
+            
+            // Send notification to business owner about status change
+            if ($business->user && $oldStatus !== $business->status) {
+                $this->notifyBusinessOwner($business, $validated['status'], $validated['reason'] ?? null);
+            }
+            
+            return response()->json([
+                'message' => 'Business status updated successfully',
+                'business' => $business->fresh()
+            ]);
+        } catch (\Exception $e) {
+            \Log::error('Error updating business status: ' . $e->getMessage(), [
+                'business_id' => $business->id ?? 'null',
+                'exception' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            return response()->json([
+                'error' => 'Error updating business status: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Send notification to business owner about status change
+     * Only notifies the business owner (the user who submitted the business)
+     */
+    private function notifyBusinessOwner(Business $business, string $newStatus, ?string $reason = null)
+    {
+        try {
+            // Load the user relationship
+            $business->load('user');
+            
+            // Get the business owner - only notify them
+            $businessOwner = User::find($business->user_id);
+            if (!$businessOwner) {
+                Log::warning('Business owner not found', [
+                    'business_id' => $business->id,
+                    'user_id' => $business->user_id
+                ]);
+                return;
+            }
+
+            // Skip if the business owner is the one who made the action (shouldn't happen, but safety check)
+            if ($business->user_id === Auth::id()) {
+                Log::info('Skipping notification - business owner is the one who made the action', [
+                    'business_id' => $business->id,
+                    'user_id' => $business->user_id
+                ]);
+                return;
+            }
+
+            // Get the "apply business" module for the owner notification
+            // The actual module name in database is "apply business"
+            $businessModule = module::where('module_name', 'apply business')
+                ->where('status', 'active')
+                ->first();
+            
+            // Try alternative names if first attempt fails
+            if (!$businessModule) {
+                $possibleNames = ['business', 'Business', 'BUSINESS', 'apply business', 'Apply Business'];
+                foreach ($possibleNames as $name) {
+                    $businessModule = module::where('module_name', $name)
+                        ->where('status', 'active')
+                        ->first();
+                    if ($businessModule) {
+                        break;
+                    }
+                }
+            }
+            
+            if (!$businessModule) {
+                Log::warning('Business module not found for owner notification', [
+                    'business_id' => $business->id,
+                    'searched_names' => ['apply business', 'business', 'Business', 'BUSINESS']
+                ]);
+                return;
+            }
+            
+            Log::info('Business module found for owner notification', [
+                'module_id' => $businessModule->id,
+                'module_name' => $businessModule->module_name,
+                'business_id' => $business->id
+            ]);
+
+            $title = '';
+            $message = '';
+
+            if ($newStatus === 'approved') {
+                $title = 'Business Approved';
+                $message = "Your business '{$business->business_name}' has been approved!";
+            } elseif ($newStatus === 'declined') {
+                $title = 'Business Declined';
+                $message = "Your business '{$business->business_name}' has been declined.";
+                if ($reason) {
+                    $message .= " Reason: {$reason}";
+                }
+            } else {
+                $title = 'Business Status Updated';
+                $message = "Your business '{$business->business_name}' status has been changed to {$newStatus}.";
+            }
+
+            // Check if business owner has notification setting for this module
+            $ownerNotificationSetting = notification_settings::where('users_id', $businessOwner->id)
+                ->where('module_id', $businessModule->id)
+                ->where('status', 'active')
+                ->first();
+            
+            if (!$ownerNotificationSetting) {
+                Log::warning('Business owner does not have active notification setting for apply business module', [
+                    'user_id' => $businessOwner->id,
+                    'user_name' => $businessOwner->name,
+                    'module_id' => $businessModule->id,
+                    'module_name' => $businessModule->module_name,
+                    'business_id' => $business->id
+                ]);
+                return; // Don't send notification if user doesn't have setting enabled
+            }
+            
+            // Send notification only to the business owner with appropriate type
+            try {
+                if ($newStatus === 'approved') {
+                    $notification = $businessOwner->notifySuccess(
+                        $title,
+                        $message,
+                        $businessModule->id
+                    );
+                } elseif ($newStatus === 'declined') {
+                    $notification = $businessOwner->notifyError(
+                        $title,
+                        $message,
+                        $businessModule->id
+                    );
+                } else {
+                    $notification = $businessOwner->notifyInfo(
+                        $title,
+                        $message,
+                        $businessModule->id
+                    );
+                }
+
+                Log::info('Business notification sent to business owner', [
+                    'notification_id' => $notification->id,
+                    'user_id' => $businessOwner->id,
+                    'user_name' => $businessOwner->name,
+                    'business_id' => $business->id,
+                    'status' => $newStatus,
+                    'module_id' => $businessModule->id,
+                    'notification_settings_id' => $notification->notification_settings_id ?? 'null'
+                ]);
+            } catch (\Exception $e) {
+                Log::error('Error sending notification to business owner', [
+                    'user_id' => $businessOwner->id,
+                    'user_name' => $businessOwner->name,
+                    'error' => $e->getMessage(),
+                    'trace' => $e->getTraceAsString(),
+                    'business_id' => $business->id,
+                    'module_id' => $businessModule->id
+                ]);
+            }
+
+        } catch (\Exception $e) {
+            Log::error('Error sending notification to business owner', [
+                'business_id' => $business->id,
+                'error' => $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Send notifications to Admin and Occupancy Manager when a business is added in business management module
+     */
+    private function sendBusinessAddedNotifications(Business $business)
+    {
+        try {
+            $users = $this->getAdminAndOccupancyManagerUsers();
+            
+            if ($users->isEmpty()) {
+                Log::info('No Admin or Occupancy Manager users found for business added notification');
+                return;
+            }
+
+            // Load relationships for message
+            $business->load('user');
+
+            // Get business management module ID
+            $businessManagementModule = module::where('module_name', 'business management')
+                ->where('status', 'active')
+                ->first();
+            
+            // Try alternative names if first attempt fails
+            if (!$businessManagementModule) {
+                $possibleNames = ['business-management', 'Business Management', 'Business-Management', 'BusinessManagement'];
+                foreach ($possibleNames as $name) {
+                    $businessManagementModule = module::where('module_name', $name)
+                        ->where('status', 'active')
+                        ->first();
+                    if ($businessManagementModule) {
+                        break;
+                    }
+                }
+            }
+            
+            $moduleId = $businessManagementModule ? $businessManagementModule->id : null;
+            
+            if (!$moduleId) {
+                Log::warning('Business management module ID not found, cannot send notifications', [
+                    'business_id' => $business->id
+                ]);
+                return;
+            }
+
+            $businessName = $business->business_name ?? 'N/A';
+            $businessType = $business->type_of_business ?? 'N/A';
+            $ownerName = $business->user->name ?? 'N/A';
+            $addedByName = Auth::user()->name ?? 'Admin';
+            
+            Log::info('Preparing to send business added notifications', [
+                'business_id' => $business->id,
+                'business_name' => $businessName,
+                'module_id' => $moduleId,
+                'users_count' => $users->count(),
+                'added_by' => $addedByName
+            ]);
+
+            $notificationsSent = 0;
+            foreach ($users as $user) {
+                // Skip the user who added the business
+                if ($user->id === Auth::id()) {
+                    continue;
+                }
+
+                try {
+                    // Admin and Occupancy Manager always receive notifications
+                    $userRole = strtolower($user->role ?? '');
+                    $isAdmin = in_array($userRole, ['admin']);
+                    $isOccupancyManager = in_array($userRole, ['occupancy manager', 'occupancies manager']);
+                    
+                    $notification = $user->notifyInfo(
+                        'New Business Added',
+                        $addedByName . " has added a new business. Business Name: " . $businessName . ". Type: " . $businessType . ". Owner: " . $ownerName . ". Status: " . ($business->status ?? 'Pending'),
+                        $moduleId
+                    );
+
+                    Log::info('Business added notification sent successfully', [
+                        'notification_id' => $notification->id,
+                        'user_id' => $user->id,
+                        'user_name' => $user->name,
+                        'user_role' => $user->role,
+                        'is_admin' => $isAdmin,
+                        'is_occupancy_manager' => $isOccupancyManager,
+                        'business_id' => $business->id,
+                        'module_id' => $moduleId,
+                        'notification_settings_id' => $notification->notification_settings_id ?? 'null'
+                    ]);
+
+                    $notificationsSent++;
+                } catch (\Exception $e) {
+                    Log::error('Error sending business added notification to user', [
+                        'user_id' => $user->id,
+                        'user_name' => $user->name,
+                        'user_role' => $user->role ?? 'N/A',
+                        'error' => $e->getMessage(),
+                        'trace' => $e->getTraceAsString(),
+                        'business_id' => $business->id,
+                        'module_id' => $moduleId
+                    ]);
+                }
+            }
+
+            Log::info('Business added notifications completed', [
+                'business_id' => $business->id,
+                'total_users_found' => $users->count(),
+                'notifications_sent' => $notificationsSent
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Error sending business added notifications: ' . $e->getMessage(), [
+                'business_id' => $business->id ?? null,
+                'trace' => $e->getTraceAsString()
+            ]);
+        }
+    }
+
+    /**
+     * Get Admin and Occupancy Manager users
+     */
+    private function getAdminAndOccupancyManagerUsers()
+    {
+        try {
+            $users = collect();
+            
+            // Get ADMIN users
+            $adminUsers = User::where('active', true)
+                ->where(function($query) {
+                    $query->where('role', 'admin')
+                          ->orWhere('role', 'Admin')
+                          ->orWhere('role', 'ADMIN')
+                          ->orWhereRaw('LOWER(role) = ?', ['admin']);
+                })
+                ->get();
+            
+            $users = $users->merge($adminUsers);
+            
+            Log::info('Admin users found for business management notifications', [
+                'admin_count' => $adminUsers->count(),
+                'admin_ids' => $adminUsers->pluck('id')->toArray()
+            ]);
+
+            // Get occupancy manager users
+            $occupancyManagerUsers = User::where('active', true)
+                ->where(function($query) {
+                    $query->where('role', 'occupancy manager')
+                          ->orWhere('role', 'Occupancy Manager')
+                          ->orWhere('role', 'OCCUPANCY MANAGER')
+                          ->orWhereRaw('LOWER(role) = ?', ['occupancy manager'])
+                          ->orWhere('role', 'occupancies manager')
+                          ->orWhereRaw('LOWER(role) = ?', ['occupancies manager']);
+                })
+                ->get();
+            
+            $users = $users->merge($occupancyManagerUsers);
+            
+            Log::info('Occupancy manager users found for business management notifications', [
+                'occupancy_manager_count' => $occupancyManagerUsers->count(),
+                'occupancy_manager_ids' => $occupancyManagerUsers->pluck('id')->toArray()
+            ]);
+
+            // Remove duplicates and return unique users
+            $uniqueUsers = $users->unique('id');
+            
+            Log::info('Total unique Admin and Occupancy Manager users', [
+                'total_count' => $uniqueUsers->count(),
+                'user_ids' => $uniqueUsers->pluck('id')->toArray(),
+                'user_names' => $uniqueUsers->pluck('name')->toArray()
+            ]);
+
+            return $uniqueUsers;
+
+        } catch (\Exception $e) {
+            Log::error('Error getting Admin and Occupancy Manager users: ' . $e->getMessage(), [
+                'trace' => $e->getTraceAsString()
+            ]);
+            return collect();
+        }
+    }
+
+    public function destroy(Business $business)
+    {
+        // Delete associated file if exists
+        if ($business->business_clearance && Storage::disk('public')->exists($business->business_clearance)) {
+            Storage::disk('public')->delete($business->business_clearance);
+        }
+        
+        $business->delete();
+        return response()->json(['message' => 'Business deleted']);
+    }
+
+    public function uploadCertificationTemplate(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+                'application_for_certification_template' => 'required|file|mimes:pdf,doc,docx,jpg,jpeg,png|max:10240'
+            ]);
+
+            $file = $request->file('application_for_certification_template');
+            $originalExtension = $file->getClientOriginalExtension();
+            $fileName = 'application_for_certification.' . $originalExtension; // Keep original extension
+            
+            // Create directory if it doesn't exist
+            $templateDirectory = storage_path('business_templates');
+            if (!is_dir($templateDirectory)) {
+                mkdir($templateDirectory, 0755, true);
+            }
+            
+            // Delete old template files (any extension)
+            if (is_dir($templateDirectory)) {
+                $oldFiles = glob($templateDirectory . '/*');
+                foreach ($oldFiles as $oldFile) {
+                    if (is_file($oldFile)) {
+                        $oldFileName = basename($oldFile);
+                        if (strpos($oldFileName, 'application_for_certification') === 0) {
+                            unlink($oldFile);
+                        }
+                    }
+                }
+            }
+            
+            // Store new template
+            $file->move($templateDirectory, $fileName);
+
+            return response()->json([
+                'message' => 'Application For Certification template uploaded successfully'
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Error uploading certification template: ' . $e->getMessage());
+            return response()->json([
+                'message' => 'Error uploading template: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function downloadCertificationTemplate(Request $request)
+    {
+        try {
+            // Get the directory path from storage/business_templates
+            $directoryPath = storage_path('business_templates');
+            
+            // Check if directory exists
+            if (!is_dir($directoryPath)) {
+                abort(404, 'Application For Certification template directory not found. Please upload a template first.');
+            }
+            
+            // Get all files in the directory using glob
+            $files = glob($directoryPath . '/*');
+            
+            // Filter out directories, keep only files
+            $files = array_filter($files, function($file) {
+                return is_file($file);
+            });
+            
+            if (empty($files)) {
+                abort(404, 'Application For Certification template not found. Please upload a template first.');
+            }
+            
+            // Find a file that starts with application_for_certification
+            $templateFile = null;
+            foreach ($files as $file) {
+                $fileName = basename($file);
+                if (strpos($fileName, 'application_for_certification') === 0) {
+                    $templateFile = $file;
+                    break;
+                }
+            }
+            
+            // Verify file exists
+            if (!$templateFile || !file_exists($templateFile)) {
+                abort(404, 'Application For Certification template file not found.');
+            }
+            
+            // Get the filename and determine MIME type
+            $fileName = basename($templateFile);
+            $mimeType = mime_content_type($templateFile);
+            
+            // Get file modification time for cache-busting
+            $lastModified = filemtime($templateFile);
+            
+            // Return file to view in browser (inline) with cache control headers
+            return response()->file($templateFile, [
+                'Content-Type' => $mimeType,
+                'Content-Disposition' => 'inline; filename="' . $fileName . '"',
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                'Pragma' => 'no-cache',
+                'Expires' => '0',
+                'Last-Modified' => gmdate('D, d M Y H:i:s', $lastModified) . ' GMT',
+                'ETag' => md5_file($templateFile)
+            ]);
+        } catch (\Illuminate\Http\Exceptions\HttpResponseException $e) {
+            // Re-throw HTTP exceptions (like abort)
+            throw $e;
+        } catch (\Exception $e) {
+            Log::error('Error viewing certification template: ' . $e->getMessage());
+            Log::error('Stack trace: ' . $e->getTraceAsString());
+            abort(404, 'Error viewing template: ' . $e->getMessage());
+        }
+    }
+}
+
+

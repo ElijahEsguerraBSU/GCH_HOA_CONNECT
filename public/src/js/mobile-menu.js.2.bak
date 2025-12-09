@@ -1,0 +1,138 @@
+import SimpleBar from "simplebar";
+
+(function () {
+    "use strict";
+
+    // Scrollbar
+    if ($(".mobile-menu .scrollable").length) {
+        new SimpleBar($(".mobile-menu .scrollable")[0]);
+    }
+
+    // Mobile Menu
+    $(".mobile-menu-toggler").on("click", function () {
+        if ($(".mobile-menu").hasClass("mobile-menu--active")) {
+            $(".mobile-menu").removeClass("mobile-menu--active");
+        } else {
+            $(".mobile-menu").addClass("mobile-menu--active");
+        }
+    });
+
+    $(".mobile-menu")
+        .find(".menu")
+        .on("click", function () {
+            if ($(this).parent().find("ul").length) {
+                if (
+                    $(this).parent().find("ul").first()[0].offsetParent !== null
+                ) {
+                    $(this)
+                        .find(".menu__sub-icon")
+                        .removeClass("transform rotate-180");
+                    $(this)
+                        .parent()
+                        .find("ul")
+                        .first()
+                        .slideUp(300, function () {
+                            $(this).removeClass("menu__sub-open");
+                        });
+                } else {
+                    $(this)
+                        .find(".menu__sub-icon")
+                        .addClass("transform rotate-180");
+                    $(this)
+                        .parent()
+                        .find("ul")
+                        .first()
+                        .slideDown(300, function () {
+                            $(this).addClass("menu__sub-open");
+                        });
+                }
+            }
+        });
+
+	// Role-based visibility: hide "Activity Records" for non-allowed roles
+	$(function () {
+		try {
+			const getRoleFromDom = () =>
+				document.querySelector('#currentUserRole')?.value ||
+				document.body.getAttribute('data-role') ||
+				document.querySelector('meta[name="current-role"]')?.getAttribute('content');
+
+			const allowedRoles = new Set([
+				'admin',
+				'administrator',
+				'superadmin',
+				'super admin'
+			]);
+
+			const hideGroup = () => {
+				try {
+					const hideLi = (li) => {
+						if (!li) return;
+						li.classList.add('hidden');
+						li.style.setProperty('display', 'none', 'important');
+					};
+
+					// Hide the group by visible menu title
+					document.querySelectorAll('.mobile-menu li').forEach(function (li) {
+						const title = li.querySelector('.menu__title');
+						if (!title) return;
+						const label = (title.textContent || '').replace(/\s+/g, ' ').trim();
+						if (/^activity\s*records$/i.test(label)) {
+							hideLi(li);
+						}
+					});
+
+					// Hide direct links as a fallback
+					document.querySelectorAll('.mobile-menu a[href*="/activity-logs"], .mobile-menu a[href*="/users-login"]').forEach(function (a) {
+						const groupLi = a.closest('ul')?.closest('li') || a.closest('li');
+						hideLi(groupLi);
+					});
+				} catch (e) {}
+			};
+
+			async function fetchRoleFallback() {
+				try {
+					const idInput = document.getElementById('currentUserId');
+					const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+					const userId = idInput ? idInput.value : null;
+					if (!userId) return null;
+					const res = await fetch(`${window.location.origin}/permission-settings/user/${userId}/role`, {
+						headers: {
+							'X-Requested-With': 'XMLHttpRequest',
+							...(csrf ? { 'X-CSRF-TOKEN': csrf } : {}),
+							'Accept': 'application/json'
+						}
+					});
+					const data = await res.json();
+					return data && data.role ? data.role : null;
+				} catch (e) {
+					return null;
+				}
+			}
+
+			(async () => {
+				const roleRaw = getRoleFromDom() || (await fetchRoleFallback());
+				const role = (roleRaw || '').toLowerCase().trim();
+
+				// Hide by default for non-allowed roles
+				if (!role || !allowedRoles.has(role)) {
+					hideGroup();
+
+					// Re-apply on DOM changes within the mobile menu (e.g., expand/collapse)
+					const menu = document.querySelector('.mobile-menu');
+					if (menu && typeof MutationObserver !== 'undefined') {
+						const obs = new MutationObserver(() => hideGroup());
+						obs.observe(menu, { childList: true, subtree: true });
+					}
+
+					// Re-apply a few times to catch late inserts
+					let attempts = 0;
+					const interval = setInterval(() => {
+						hideGroup();
+						if (++attempts >= 10) clearInterval(interval);
+					}, 300);
+				}
+			})();
+		} catch (e) {}
+	});
+})();

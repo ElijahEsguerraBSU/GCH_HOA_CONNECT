@@ -1,0 +1,336 @@
+<?php
+
+namespace App\Traits;
+
+use App\Models\Notification;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+trait NotificationTrait
+{
+    /**
+     * Get all custom notifications for this user
+     */
+    public function customNotifications(): HasMany
+    {
+        return $this->hasMany(Notification::class, 'users_id', 'id');
+    }
+
+    /**
+     * Send a custom notification to this user
+     */
+    public function sendCustomNotification(string $type, string $title, string $message, int $moduleId = null): Notification
+    {
+        $notificationSettingsId = null;
+        
+        // If moduleId is provided, find the notification_settings_id for this user and module
+        if ($moduleId) {
+            $notificationSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                ->where('module_id', $moduleId)
+                ->where('status', 'active')
+                ->first();
+            
+            if ($notificationSetting) {
+                $notificationSettingsId = $notificationSetting->id;
+            }
+        }
+        
+        return $this->customNotifications()->create([
+            'users_id' => $this->id,
+            'type' => $type,
+            'title' => $title,
+            'message' => $message,
+            'notification_settings_id' => $notificationSettingsId,
+            'read_at' => null,
+        ]);
+    }
+
+    /**
+     * Send success notification
+     */
+    public function notifySuccess(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('success', $title, $message, $moduleId);
+    }
+
+    /**
+     * Send error notification
+     */
+    public function notifyError(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('error', $title, $message, $moduleId);
+    }
+
+    /**
+     * Send warning notification
+     */
+    public function notifyWarning(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('warning', $title, $message, $moduleId);
+    }
+
+    /**
+     * Send info notification
+     */
+    public function notifyInfo(string $title, string $message, int $moduleId = null): Notification
+    {
+        return $this->sendCustomNotification('info', $title, $message, $moduleId);
+    }
+
+    /**
+     * Mark notification as read
+     */
+    public function markNotificationAsRead(int $notificationId): bool
+    {
+        $notification = $this->customNotifications()->find($notificationId);
+        
+        if ($notification && !$notification->read_at) {
+            $notification->markAsRead();
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
+     * Mark all notifications as read
+     */
+    public function markAllNotificationsAsRead(): int
+    {
+        return $this->customNotifications()
+            ->whereNull('read_at')
+            ->update(['read_at' => now()]);
+    }
+
+    /**
+     * Get unread notifications count
+     */
+    public function getUnreadNotificationsCount(): int
+    {
+        return $this->getUnreadNotifications()->count();
+    }
+
+    /**
+     * Get unread notifications filtered by notification settings
+     */
+    public function getUnreadNotifications()
+    {
+        $notifications = $this->customNotifications()
+            ->whereNull('read_at')
+            ->orderBy('created_at', 'desc')
+            ->get();
+        
+        // Filter notifications based on notification settings
+        $filteredNotifications = $notifications->filter(function($notification) {
+            // If notification has notification_settings_id, check if setting is still active
+            if ($notification->notification_settings_id) {
+                // Convert to string for comparison (database stores as varchar)
+                $settingId = (string) $notification->notification_settings_id;
+                $userId = (string) $this->id;
+                
+                $setting = \App\Models\notification_settings::where('id', $settingId)
+                    ->where('users_id', $userId)
+                    ->where('status', 'active')
+                    ->whereNull('deleted_at')
+                    ->first();
+                
+                // If the original setting is active, include the notification
+                if ($setting !== null) {
+                    return true;
+                }
+                
+                // If the original setting is inactive, check if user currently has active setting for the same module
+                // This handles cases where notifications were disabled then re-enabled
+                if ($setting === null) {
+                    // Get the module from the inactive setting to check current status
+                    $originalSetting = \App\Models\notification_settings::where('id', $settingId)
+                        ->where('users_id', $userId)
+                        ->whereNull('deleted_at')
+                        ->first();
+                    
+                    if ($originalSetting && $originalSetting->module_id) {
+                        $currentSetting = \App\Models\notification_settings::where('users_id', $userId)
+                            ->where('module_id', $originalSetting->module_id)
+                            ->where('status', 'active')
+                            ->whereNull('deleted_at')
+                            ->first();
+                        return $currentSetting !== null;
+                    }
+                }
+            }
+            
+            // For notifications without notification_settings_id, check by module
+            // Check if it's a chat notification
+            $isChatNotification = $notification->type === 'message' 
+                || stripos($notification->title, 'New Message') !== false;
+            
+            if ($isChatNotification) {
+                // Find chat module
+                $chatModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'Chat')
+                      ->orWhere('module_name', 'chat')
+                      ->orWhere('module_name', 'Chat Management')
+                      ->orWhere('module_name', 'chat management');
+                })->where('status', 'active')->first();
+                
+                if ($chatModule) {
+                    $hasChatSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                        ->where('module_id', $chatModule->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    return $hasChatSetting;
+                }
+                return false; // No chat module found, exclude notification
+            }
+            
+            // Check if it's a chatbot notification
+            $isChatbotNotification = stripos($notification->title, 'chatbot') !== false
+                || stripos($notification->title, 'guest message') !== false
+                || stripos($notification->message, 'chatbot') !== false;
+            
+            if ($isChatbotNotification) {
+                // Find chatbot module
+                $chatbotModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'Guest Chatbot')
+                      ->orWhere('module_name', 'guest chatbot')
+                      ->orWhere('module_name', 'Chatbot')
+                      ->orWhere('module_name', 'chatbot')
+                      ->orWhere('module_name', 'Chat Bot')
+                      ->orWhere('module_name', 'chat bot');
+                })->where('status', 'active')->first();
+                
+                if ($chatbotModule) {
+                    $hasChatbotSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                        ->where('module_id', $chatbotModule->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    return $hasChatbotSetting;
+                }
+                return false; // No chatbot module found, exclude notification
+            }
+            
+            // Check if it's an appointment notification
+            $isAppointmentNotification = stripos($notification->title, 'Appointment') !== false
+                || stripos($notification->title, 'appointment') !== false
+                || stripos($notification->message, 'appointment') !== false
+                || stripos($notification->message, 'tracking') !== false;
+            
+            if ($isAppointmentNotification) {
+                // Check for "apply appointment" module first (for users who made appointments)
+                $applyAppointmentModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'apply appointment')
+                      ->orWhere('module_name', 'Apply Appointment')
+                      ->orWhere('module_name', 'apply-appointment');
+                })->where('status', 'active')->first();
+                
+                if ($applyAppointmentModule) {
+                    $hasApplyAppointmentSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                        ->where('module_id', $applyAppointmentModule->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    if ($hasApplyAppointmentSetting) {
+                        return true;
+                    }
+                }
+                
+                // Also check for "appointment management" module (for admin/coordinator users)
+                $appointmentModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'Appointment Management')
+                      ->orWhere('module_name', 'appointment management')
+                      ->orWhere('module_name', 'Appointment')
+                      ->orWhere('module_name', 'appointment');
+                })->where('status', 'active')->first();
+                
+                if ($appointmentModule) {
+                    $hasAppointmentSetting = \App\Models\notification_settings::where('users_id', $this->id)
+                        ->where('module_id', $appointmentModule->id)
+                        ->where('status', 'active')
+                        ->exists();
+                    return $hasAppointmentSetting;
+                }
+                return false; // No appointment module found, exclude notification
+            }
+            
+            // Check if it's a business notification - Admin and Occupancy Manager should always see them
+            $notificationTitle = strtolower(trim($notification->title ?? ''));
+            $notificationMessage = strtolower(trim($notification->message ?? ''));
+            
+            $isBusinessNotification = 
+                stripos($notificationTitle, 'business') !== false
+                || stripos($notificationMessage, 'business') !== false
+                || stripos($notificationMessage, 'submitted a new business') !== false
+                || stripos($notificationMessage, 'new business registration') !== false
+                || stripos($notificationMessage, 'business added') !== false
+                || stripos($notificationMessage, 'business approved') !== false
+                || stripos($notificationMessage, 'business declined') !== false;
+            
+            if ($isBusinessNotification) {
+                $userRole = strtolower(trim($this->role ?? ''));
+                $isAdmin = $userRole === 'admin';
+                $isOccupancyManager = in_array($userRole, ['occupancy manager', 'occupancies manager']);
+                
+                // Admin and Occupancy Manager should ALWAYS see business notifications
+                // Even if notification_settings_id is null or inactive
+                if ($isAdmin || $isOccupancyManager) {
+                    return true;
+                }
+                
+                // For other users, check if they have notification settings for business modules
+                $businessModule = \App\Models\module::where(function($m) {
+                    $m->where('module_name', 'business management')
+                      ->orWhere('module_name', 'Business Management')
+                      ->orWhere('module_name', 'business-management')
+                      ->orWhere('module_name', 'apply business')
+                      ->orWhere('module_name', 'Apply Business');
+                })->where('status', 'active')->first();
+                
+                if ($businessModule) {
+                    $userId = (string) $this->id;
+                    $hasBusinessSetting = \App\Models\notification_settings::where('users_id', $userId)
+                        ->where('module_id', $businessModule->id)
+                        ->where('status', 'active')
+                        ->whereNull('deleted_at')
+                        ->exists();
+                    return $hasBusinessSetting;
+                }
+                return false; // No business module found, exclude notification
+            }
+            
+            // For other notifications without notification_settings_id, exclude them
+            return false;
+        });
+        
+        // Return a query builder-like object for compatibility
+        $ids = $filteredNotifications->pluck('id')->toArray();
+        
+        // If no filtered notifications, return empty query
+        if (empty($ids)) {
+            return $this->customNotifications()
+                ->whereNull('read_at')
+                ->whereRaw('1 = 0') // Always false condition
+                ->orderBy('created_at', 'desc');
+        }
+        
+        return $this->customNotifications()
+            ->whereNull('read_at')
+            ->whereIn('id', $ids)
+            ->orderBy('created_at', 'desc');
+    }
+
+    /**
+     * Get recent notifications
+     */
+    public function getRecentNotifications(int $limit = 10)
+    {
+        return $this->customNotifications()->orderBy('created_at', 'desc')->limit($limit);
+    }
+
+    /**
+     * Delete old notifications
+     */
+    public function deleteOldNotifications(int $days = 30): int
+    {
+        return $this->customNotifications()
+            ->where('created_at', '<', now()->subDays($days))
+            ->delete();
+    }
+}

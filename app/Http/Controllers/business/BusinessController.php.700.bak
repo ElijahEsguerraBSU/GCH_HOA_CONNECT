@@ -1,0 +1,518 @@
+<?php
+
+namespace App\Http\Controllers\business;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\business_management_list;
+use App\Models\User;
+use App\Models\module;
+use App\Models\notification_settings;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
+
+class BusinessController extends Controller
+{
+    public function index(Request $request)
+    {
+        // Get per_page from request, default to 10
+        $perPage = $request->input('per_page', 10);
+        
+        // Start query - Get current user's businesses only
+        $query = business_management_list::with('user')
+            ->where('user_id', Auth::id());
+        
+        // Search functionality
+        if ($request->has('search') && $request->search !== '') {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('business_name', 'LIKE', "%{$search}%")
+                  ->orWhere('type_of_business', 'LIKE', "%{$search}%")
+                  ->orWhere('address', 'LIKE', "%{$search}%");
+            });
+        }
+        
+        // Status filter
+        if ($request->has('status') && $request->status !== 'all') {
+            $query->where('status', $request->status);
+        }
+        
+        // Order by creation date
+        $query->orderBy('created_at', 'desc');
+        
+        // Paginate results and append query parameters
+        $businesses = $query->paginate($perPage)->appends($request->except('page'));
+
+        // Check if Application For Certification template exists
+        $hasCertificationTemplate = false;
+        $templateDirectory = storage_path('business_templates');
+        if (is_dir($templateDirectory)) {
+            $files = glob($templateDirectory . '/*');
+            foreach ($files as $file) {
+                if (is_file($file) && strpos(basename($file), 'application_for_certification') === 0) {
+                    $hasCertificationTemplate = true;
+                    break;
+                }
+            }
+        }
+
+        return view('business.business', compact('businesses', 'hasCertificationTemplate'));
+    }
+
+    public function store(Request $request)
+    {
+        try {
+            $validated = $request->validate([
+                'business_name' => 'required|string|max:255',
+                'type_of_business' => 'required|string|max:255',
+                'address' => 'nullable|string|max:500',
+                'business_clearance' => 'required|array|max:5',
+                'business_clearance.*' => 'file|mimes:pdf,jpg,jpeg,png|max:15360',
+            ]);
+
+            // Handle multiple file uploads
+            $filePaths = [];
+            if ($request->hasFile('business_clearance')) {
+                $files = $request->file('business_clearance');
+                foreach ($files as $file) {
+                    $fileName = time() . '_' . uniqid() . '_' . $file->getClientOriginalName();
+                    // Store file and save full path in database
+                    $filePath = $file->storeAs('business-clearances', $fileName, 'public');
+                    $filePaths[] = $filePath;
+                }
+            }
+
+            // Create business with logged-in user
+            $business = business_management_list::create([
+                'user_id' => Auth::id(),
+                'business_name' => $validated['business_name'],
+                'type_of_business' => $validated['type_of_business'],
+                'address' => $validated['address'] ?? null,
+                'business_clearance' => json_encode($filePaths), // Store as JSON array
+                'status' => 'pending',
+                'reason' => null,
+            ]);
+
+            // Send notifications to users who have business-management module notifications enabled
+            $this->sendBusinessManagementNotifications($business);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Business registered successfully',
+                'business' => $business->load('user')
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error registering business: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function show($id)
+    {
+        try {
+            $business = business_management_list::with('user')->findOrFail($id);
+            
+            return response()->json([
+                'success' => true,
+                'business' => $business
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Business not found'
+            ], 404);
+        }
+    }
+
+    public function update(Request $request, $id)
+    {
+        try {
+            $business = business_management_list::findOrFail($id);
+            
+            // Check if the current user owns this business
+            if ($business->user_id != Auth::id()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'You can only edit your own business'
+                ], 403);
+            }
+
+            $validated = $request->validate([
+                'business_name' => 'required|string|max:255',
+                'type_of_business' => 'required|string|max:255',
+                'address' => 'nullable|string|max:500',
+                'business_clearance' => 'nullable|array|max:5',
+                'business_clearance.*' => 'file|mimes:pdf,jpg,jpeg,png|max:15360',
+            ]);
+
+            // Handle multiple file uploads
+            if ($request->hasFile('business_clearance')) {
+                // Delete old files if they exist
+                if ($business->business_clearance) {
+                    $oldFiles = json_decode($business->business_clearance, true);
+                    if (is_array($oldFiles)) {
+                        foreach ($oldFiles as $oldFile) {
+                            if (Storage::disk('public')->exists($oldFile)) {
+                                Storage::disk('public')->delete($oldFile);
+                            }
+                        }
+                    } else {
+                        // Handle legacy single file format
+                        if (Storage::disk('public')->exists($business->business_clearance)) {
+                            Storage::disk('public')->delete($business->business_clearance);
+                        }
+                    }
+                }
+                
+                $files = $request->file('business_clearance');
+                $filePaths = [];
+                foreach ($files as $file) {
+                    $fileName = time() . '_' . uniqid() . '_' . $file->getClientOriginalName();
+                    // Store file and save full path in database
+                    $filePath = $file->storeAs('business-clearances', $fileName, 'public');
+                    $filePaths[] = $filePath;
+                }
+                $validated['business_clearance'] = json_encode($filePaths); // Store as JSON array
+            }
+
+            $business->update($validated);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Business updated successfully',
+                'business' => $business->fresh()
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error updating business: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function destroy($id)
+    {
+        try {
+            $business = business_management_list::findOrFail($id);
+            
+            // Check if the current user owns this business
+            if ($business->user_id != Auth::id()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'You can only delete your own business'
+                ], 403);
+            }
+            
+            // Delete files if they exist
+            if ($business->business_clearance) {
+                $files = json_decode($business->business_clearance, true);
+                if (is_array($files)) {
+                    // Handle multiple files (JSON array)
+                    foreach ($files as $file) {
+                        if (Storage::disk('public')->exists($file)) {
+                            Storage::disk('public')->delete($file);
+                        }
+                    }
+                } else {
+                    // Handle legacy single file format
+                    if (Storage::disk('public')->exists($business->business_clearance)) {
+                        Storage::disk('public')->delete($business->business_clearance);
+                    }
+                }
+            }
+            
+            $business->delete();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Business deleted successfully'
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error deleting business'
+            ], 500);
+        }
+    }
+
+    /**
+     * Get users who should receive business management notifications
+     * Includes: users with notification settings, ADMIN, and occupancy manager
+     */
+    private function getBusinessManagementNotificationUsers()
+    {
+        try {
+            $users = collect();
+            
+            // Find the business management module
+            // The actual module name in database is "business management" (with space)
+            $businessManagementModule = module::where('module_name', 'business management')
+                ->where('status', 'active')
+                ->first();
+            
+            // Try alternative names if first attempt fails
+            if (!$businessManagementModule) {
+                $possibleNames = ['business-management', 'Business Management', 'Business-Management', 'BusinessManagement'];
+                foreach ($possibleNames as $name) {
+                    $businessManagementModule = module::where('module_name', $name)
+                        ->where('status', 'active')
+                        ->first();
+                    if ($businessManagementModule) {
+                        break;
+                    }
+                }
+            }
+            
+            if (!$businessManagementModule) {
+                Log::warning('Business management module not found or inactive', [
+                    'searched_names' => ['business management', 'business-management', 'Business Management']
+                ]);
+            } else {
+                Log::info('Business management module found', [
+                    'module_id' => $businessManagementModule->id,
+                    'module_name' => $businessManagementModule->module_name
+                ]);
+
+                // Get users with active notification settings for business-management
+                $notificationSettings = notification_settings::with('user')
+                    ->where('module_id', $businessManagementModule->id)
+                    ->where('status', 'active')
+                    ->get();
+
+                $usersWithSettings = $notificationSettings->map(function ($setting) {
+                    return $setting->user;
+                })->filter(); // Remove any null users
+                
+                $users = $users->merge($usersWithSettings);
+            }
+
+            // Also get ADMIN users (regardless of notification settings)
+            $adminUsers = User::where('active', true)
+                ->where(function($query) {
+                    $query->where('role', 'admin')
+                          ->orWhere('role', 'Admin')
+                          ->orWhere('role', 'ADMIN')
+                          ->orWhereRaw('LOWER(role) = ?', ['admin']);
+                })
+                ->get();
+            
+            $users = $users->merge($adminUsers);
+            
+            Log::info('Admin users found for business management notifications', [
+                'admin_count' => $adminUsers->count(),
+                'admin_ids' => $adminUsers->pluck('id')->toArray()
+            ]);
+
+            // Also get occupancy manager users (regardless of notification settings)
+            $occupancyManagerUsers = User::where('active', true)
+                ->where(function($query) {
+                    $query->where('role', 'occupancy manager')
+                          ->orWhere('role', 'Occupancy Manager')
+                          ->orWhere('role', 'OCCUPANCY MANAGER')
+                          ->orWhereRaw('LOWER(role) = ?', ['occupancy manager'])
+                          ->orWhere('role', 'occupancies manager')
+                          ->orWhereRaw('LOWER(role) = ?', ['occupancies manager']);
+                })
+                ->get();
+            
+            $users = $users->merge($occupancyManagerUsers);
+            
+            Log::info('Occupancy manager users found for business management notifications', [
+                'occupancy_manager_count' => $occupancyManagerUsers->count(),
+                'occupancy_manager_ids' => $occupancyManagerUsers->pluck('id')->toArray()
+            ]);
+
+            // Remove duplicates and return unique users
+            $uniqueUsers = $users->unique('id');
+            
+            Log::info('Total unique users to notify for business management', [
+                'total_count' => $uniqueUsers->count(),
+                'user_ids' => $uniqueUsers->pluck('id')->toArray(),
+                'user_names' => $uniqueUsers->pluck('name')->toArray()
+            ]);
+
+            return $uniqueUsers;
+
+        } catch (\Exception $e) {
+            Log::error('Error getting business-management notification users: ' . $e->getMessage(), [
+                'trace' => $e->getTraceAsString()
+            ]);
+            return collect();
+        }
+    }
+
+    /**
+     * Send notification to business-management users when a business is created
+     */
+    private function sendBusinessManagementNotifications($business)
+    {
+        try {
+            $users = $this->getBusinessManagementNotificationUsers();
+            
+            if ($users->isEmpty()) {
+                Log::info('No business-management notification users found');
+                return;
+            }
+
+            // Load relationships for message
+            $business->load('user');
+
+            // Get business management module ID
+            // The actual module name in database is "business management" (with space)
+            $businessManagementModule = module::where('module_name', 'business management')
+                ->where('status', 'active')
+                ->first();
+            
+            // Try alternative names if first attempt fails
+            if (!$businessManagementModule) {
+                $possibleNames = ['business-management', 'Business Management', 'Business-Management', 'BusinessManagement'];
+                foreach ($possibleNames as $name) {
+                    $businessManagementModule = module::where('module_name', $name)
+                        ->where('status', 'active')
+                        ->first();
+                    if ($businessManagementModule) {
+                        break;
+                    }
+                }
+            }
+            
+            $moduleId = $businessManagementModule ? $businessManagementModule->id : null;
+            
+            if (!$moduleId) {
+                Log::warning('Business management module ID not found, cannot send notifications', [
+                    'business_id' => $business->id
+                ]);
+                return;
+            }
+
+            $businessName = $business->business_name ?? 'N/A';
+            $businessType = $business->type_of_business ?? 'N/A';
+            $userName = $business->user->name ?? 'N/A';
+            
+            Log::info('Preparing to send business management notifications', [
+                'business_id' => $business->id,
+                'business_name' => $businessName,
+                'module_id' => $moduleId,
+                'users_count' => $users->count()
+            ]);
+
+            $notificationsSent = 0;
+            foreach ($users as $user) {
+                // Skip the user who created the business
+                if ($user->id === Auth::id()) {
+                    continue;
+                }
+
+                try {
+                    // Check if user is ADMIN or occupancy manager (they should always receive notifications)
+                    $userRole = strtolower(trim($user->role ?? ''));
+                    $isAdmin = $userRole === 'admin';
+                    $isOccupancyManager = in_array($userRole, ['occupancy manager', 'occupancies manager']);
+                    
+                    Log::info('Checking user for notification', [
+                        'user_id' => $user->id,
+                        'user_name' => $user->name,
+                        'user_role' => $user->role,
+                        'user_role_lower' => $userRole,
+                        'is_admin' => $isAdmin,
+                        'is_occupancy_manager' => $isOccupancyManager
+                    ]);
+                    
+                    // Admin and Occupancy Manager always receive notifications (no need to check notification settings)
+                    // Other users need to have notification settings enabled
+                    if (!$isAdmin && !$isOccupancyManager) {
+                        $userNotificationSetting = notification_settings::where('users_id', $user->id)
+                            ->where('module_id', $moduleId)
+                            ->where('status', 'active')
+                            ->first();
+                        
+                        if (!$userNotificationSetting) {
+                            Log::warning('User does not have active notification setting for business management module', [
+                                'user_id' => $user->id,
+                                'user_name' => $user->name,
+                                'user_role' => $user->role,
+                                'module_id' => $moduleId,
+                                'business_id' => $business->id
+                            ]);
+                            continue; // Skip this user if they're not admin/occupancy manager and don't have settings
+                        }
+                    }
+                    
+                    // Format notification message similar to feedback notifications
+                    $notificationMessage = Auth::user()->name . " has submitted a new business registration. Business Name: " . $businessName . ". Type: " . $businessType . ". Status: " . ($business->status ?? 'Pending');
+                    
+                    $notification = $user->notifyInfo(
+                        'New Business Registration',
+                        $notificationMessage,
+                        $moduleId
+                    );
+
+                    Log::info('Business management notification sent successfully', [
+                        'notification_id' => $notification->id,
+                        'user_id' => $user->id,
+                        'user_name' => $user->name,
+                        'user_role' => $user->role,
+                        'is_admin' => $isAdmin,
+                        'is_occupancy_manager' => $isOccupancyManager,
+                        'business_id' => $business->id,
+                        'module_id' => $moduleId,
+                        'notification_settings_id' => $notification->notification_settings_id ?? 'null'
+                    ]);
+
+                    $notificationsSent++;
+                } catch (\Exception $e) {
+                    Log::error('Error sending notification to user', [
+                        'user_id' => $user->id,
+                        'user_name' => $user->name,
+                        'user_role' => $user->role ?? 'N/A',
+                        'error' => $e->getMessage(),
+                        'trace' => $e->getTraceAsString(),
+                        'business_id' => $business->id,
+                        'module_id' => $moduleId
+                    ]);
+                }
+            }
+
+            Log::info('Business-management notifications completed', [
+                'business_id' => $business->id,
+                'total_users_found' => $users->count(),
+                'notifications_sent' => $notificationsSent
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Error sending business-management notifications: ' . $e->getMessage(), [
+                'business_id' => $business->id ?? null
+            ]);
+        }
+    }
+
+    public function downloadCertificationTemplate()
+    {
+        // Find template file
+        $templateDirectory = storage_path('business_templates');
+        $templateFile = null;
+        
+        if (is_dir($templateDirectory)) {
+            $files = glob($templateDirectory . '/*');
+            foreach ($files as $file) {
+                if (is_file($file) && strpos(basename($file), 'application_for_certification') === 0) {
+                    $templateFile = $file;
+                    break;
+                }
+            }
+        }
+        
+        if (!$templateFile || !file_exists($templateFile)) {
+            abort(404, 'Application For Certification template not found');
+        }
+
+        $fileName = basename($templateFile);
+        
+        return response()->download($templateFile, $fileName);
+    }
+}
